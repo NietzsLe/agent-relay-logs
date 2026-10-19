@@ -82,6 +82,125 @@ OUT2=$(./.relay/relay --agent other --session "$SID2" sync)
 ./.relay/relay doctor >/dev/null
 pass "relay start/end/sync/doctor"
 
+# --- schema v2: detail in every event type ---------------------------------
+P4="$TMP/project4"
+mkdir -p "$P4"
+"$ROOT/scripts/install.sh" --target "$P4" >/dev/null
+cd "$P4"
+S4="v2-$$"
+./.relay/relay --agent tester2 --session "$S4" start "task v2" \
+    --goal "why this task exists" --plan "step one" --plan "step two" \
+    --scope "src/a,src/b" --tags "perf,db" --accept "tests green" --refs "T-65,L-42" >/dev/null
+TASK=$(python3 - <<EOF
+import json, glob
+for line in open(glob.glob(".relay/data/$S4.jsonl")[0]):
+    e = json.loads(line)
+    if e["type"] == "start":
+        print(e["id"])
+EOF
+)
+[ -n "$TASK" ] || fail "no task id written"
+
+./.relay/relay --session "$S4" note --kind problem --text "deadlock in migrate" \
+    --detail "ERROR: lock wait timeout" >/dev/null
+./.relay/relay --session "$S4" end --status done \
+    --summary "everything works now" --done "applied advisory lock" \
+    --problem "deadlock => advisory lock" --verify "pytest green" \
+    --metric "p50 120ms -> 40ms (n=200, window=10m)" \
+    --changes "src/a.py, src/b.py" --commit "abc1234" --next "T-66" --lesson "L-42" \
+    --impact "needs deploy" >/dev/null
+
+python3 - <<EOF
+import json, glob, sys
+events = [json.loads(l) for l in open(glob.glob(".relay/data/$S4.jsonl")[0])]
+by = {}
+for e in events:
+    by.setdefault(e["type"], []).append(e)
+start = by["start"][0]
+end = by["end"][0]
+note = by["note"][0]
+errs = []
+def check(cond, msg):
+    if not cond:
+        errs.append(msg)
+check(start.get("goal") == "why this task exists", "goal not stored")
+check(start.get("plan") == ["step one", "step two"], "plan not stored: %r" % start.get("plan"))
+check(start.get("scope") == ["src/a", "src/b"], "scope not split: %r" % start.get("scope"))
+check(start.get("tags") == ["perf", "db"], "tags not stored")
+check(start.get("accept") == ["tests green"], "accept not stored")
+check(start.get("refs") == ["T-65", "L-42"], "refs not stored")
+check(note.get("kind") == "problem", "note kind missing")
+check(note.get("detail") == ["ERROR: lock wait timeout"], "note detail missing")
+check(end.get("done") == ["applied advisory lock"], "done not stored")
+check(end.get("problems") == ["deadlock => advisory lock"], "problems not stored")
+check(end.get("verify") == ["pytest green"], "verify not stored")
+check(end.get("metrics") and "n=200" in end["metrics"][0], "metrics not stored")
+check(end.get("changes") == ["src/a.py", "src/b.py"], "changes not split: %r" % end.get("changes"))
+check(end.get("commits") == ["abc1234"], "commits not stored")
+check(end.get("next") == ["T-66"], "next not stored")
+check(end.get("lessons") == ["L-42"], "lessons not stored")
+check(end.get("impact") == "needs deploy", "impact not stored")
+check(end.get("notes") == 1, "note count not recorded: %r" % end.get("notes"))
+check(isinstance(end.get("duration_s"), int), "duration not recorded")
+check(end.get("agent") == "tester2", "agent not inherited: %r" % end.get("agent"))
+check(note.get("agent") == "tester2", "note agent not inherited: %r" % note.get("agent"))
+if errs:
+    print("FAIL: " + "; ".join(errs), file=sys.stderr)
+    sys.exit(1)
+EOF
+pass "every event type stores its detail"
+
+# --- smart comma splitting --------------------------------------------------
+./.relay/relay --agent tester3 --session "split-$$" start "split test" >/dev/null
+./.relay/relay --session "split-$$" end --status done --summary "s" \
+    --changes "repo (new, commit abc)" --changes "x.py,y.py" >/dev/null
+python3 - <<EOF
+import json, glob, sys
+events = [json.loads(l) for l in open(glob.glob(".relay/data/split-$$.jsonl")[0])]
+end = [e for e in events if e["type"] == "end"][0]
+if end.get("changes") != ["repo (new, commit abc)", "x.py", "y.py"]:
+    print("FAIL: changes not parsed as expected: %r" % end.get("changes"), file=sys.stderr)
+    sys.exit(1)
+EOF
+pass "commas inside brackets do not break field parsing"
+
+# --- show prints one task in full -------------------------------------------
+OUT=$(./.relay/relay --session "show-$$" show "$TASK")
+echo "$OUT" | grep -q "why this task exists" || fail "show did not print the goal"
+echo "$OUT" | grep -q "deadlock in migrate" || fail "show did not print the note"
+echo "$OUT" | grep -q "advisory lock" || fail "show did not print the problems"
+echo "$OUT" | grep -q "n=200" || fail "show did not print the metrics"
+pass "show prints the full task"
+
+# --- notes are visible to other sessions ------------------------------------
+OUT=$(./.relay/relay --agent reader --session "reader-$$" sync)
+echo "$OUT" | grep -q "deadlock in migrate" || fail "sync did not show the note"
+pass "sync shows notes of other sessions"
+
+# --- oversized events stay valid JSON ---------------------------------------
+python3 - <<EOF
+import json, subprocess, glob, sys
+big = "x" * 300
+args = ["./.relay/relay", "--agent", "big", "--session", "big-$$", "start", "big task"]
+for _ in range(12):
+    args += ["--plan", big]
+for _ in range(30):
+    args += ["--scope", big]
+subprocess.run(args, check=True, capture_output=True)
+path = glob.glob(".relay/data/big-$$.jsonl")[0]
+for line in open(path):
+    e = json.loads(line)   # must not raise
+    if e["type"] == "start":
+        assert e.get("trimmed") is True, "oversized event was not flagged as trimmed"
+EOF
+pass "oversized events stay valid JSON and are flagged"
+
+# --- old schema v1 events still render -------------------------------------
+printf '%s\n' '{"id": "old-1", "ts": "2026-10-19T10:00:00Z", "type": "start", "session": "legacy", "agent": "legacy", "cwd": ".", "branch": "main", "head": "abc1234", "title": "legacy task", "scope": ["src/legacy"]}' > .relay/data/legacy.jsonl
+OUT=$(./.relay/relay --agent reader2 --session "reader2-$$" sync --all)
+echo "$OUT" | grep -q "legacy task" || fail "schema v1 events no longer render"
+pass "schema v1 events still render"
+
 # --- uninstall dry run -----------------------------------------------------
 "$ROOT/scripts/uninstall.sh" --target "$P" --dry-run >/dev/null
 contains "BEGIN relay-logs" "$P/AGENTS.md"

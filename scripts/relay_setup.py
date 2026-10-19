@@ -21,7 +21,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = REPO_ROOT / "package"
 TEMPLATES = REPO_ROOT / "templates"
@@ -167,11 +167,23 @@ def remove_block(path, dry_run, backup):
     return "removed %d block(s)" % count
 
 
+def runtime_version(path=None):
+    """Read the version string of a relay runtime file (best effort)."""
+    path = path or (PACKAGE / "relay")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "?"
+    match = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return match.group(1) if match else "?"
+
+
 def install_package(target, force, dry_run):
     relay_dir = target / ".relay"
     if relay_dir.exists() and not relay_dir.is_dir():
         fail("%s exists and is not a directory" % relay_dir)
 
+    new_version = runtime_version()
     actions = []
     for name in RUNTIME_FILES:
         src = PACKAGE / name
@@ -188,7 +200,11 @@ def install_package(target, force, dry_run):
                 actions.append("%s: unchanged" % name)
                 continue
             if not force:
-                actions.append("%s: kept existing (use --force to update)" % name)
+                if name == "relay":
+                    actions.append("relay: kept existing (v%s; use --force to update to v%s)"
+                                   % (runtime_version(dst), new_version))
+                else:
+                    actions.append("%s: kept existing (use --force to update)" % name)
                 continue
         if not dry_run:
             relay_dir.mkdir(parents=True, exist_ok=True)
@@ -311,6 +327,7 @@ def cmd_install(args):
 
     manifest.update({
         "version": VERSION,
+        "runtime_version": runtime_version(),
         "target": str(target),
         "last_installed_at": now(),
         "gitignore_added": bool(manifest.get("gitignore_added") or gi_added),

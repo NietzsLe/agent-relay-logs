@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""relay — per-session work log for multiple agents.
+"""relay — per-session work log for multiple agents (schema v2).
 
-See README.md next to this file. Only the Python standard library is used.
-The log is local-only and append-only: one JSONL file per session, plus a
-byte-offset cursor per session.
+One JSON object per line in data/<session>.jsonl (append-only, one writer per
+file). Event types:
+
+  join  — session profile (agent, model, host, cwd, branch, head…)
+  start — a task opens: what will be done, how, and how "done" is judged
+  note  — while working: progress / problem / decision / result / blocker
+  end   — a task closes: what was done, problems, verification, next steps
+
+Every event type carries detail, because a log that only says "task X started"
+tells the next session nothing useful. See README.md next to this file.
+Python standard library only.
 """
 import argparse
 import json
@@ -15,15 +23,31 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
+SCHEMA = 2
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 STALE_H = float(os.environ.get("RELAY_STALE_HOURS", "12"))
 CAP = 25          # maximum lines printed by one sync
 RECENT_DONE = 10  # first sync in a session: number of recently finished items
+MAX_LINE = 8000   # hard cap for one event line (JSON must stay valid)
 NOTE = "[relay] log is only relatively complete — verify git/real state before relying on it"
 
+KINDS = ("progress", "problem", "decision", "result", "blocker", "question")
 
+# field -> (max items, max chars per item) for list fields
+LIST_LIMITS = {
+    "plan": (12, 300), "accept": (8, 300), "outs": (8, 300), "scope": (30, 200),
+    "tags": (12, 60), "refs": (20, 200), "detail": (20, 300), "done": (20, 300),
+    "problems": (20, 400), "verify": (12, 300), "metrics": (12, 200),
+    "changes": (40, 200), "commits": (10, 60), "next": (12, 300), "lessons": (8, 40),
+}
+TEXT_LIMITS = {
+    "title": 120, "goal": 600, "text": 600, "summary": 1000, "impact": 600,
+}
+
+
+# --------------------------------------------------------------------------- utils
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -44,29 +68,108 @@ def git(*a):
         return ""
 
 
-def clip(v, n=300):
-    if isinstance(v, list):
-        return [clip(x, 120) for x in v[:30]]
-    v = (v or "").replace("\n", " ").strip()
-    return v if len(v) <= n else v[: n - 1] + "…"
+def clip_text(v, n):
+    """Truncate but keep the marker explicit, and keep newlines (detail matters)."""
+    v = (v or "").rstrip()
+    if len(v) <= n:
+        return v
+    return v[: max(0, n - 20)].rstrip() + " …(+%d ký tự)" % (len(v) - n)
 
 
-def split(s):
-    return [x.strip() for x in (s or "").split(",") if x.strip()]
+def clip_list(items, count, width):
+    out = []
+    for item in items:
+        item = clip_text(item, width)
+        if item:
+            out.append(item)
+    if len(out) > count:
+        out = out[:count] + ["…(+%d mục)" % (len(out) - count)]
+    return out
+
+
+def smart_split(s):
+    """Split on commas that are not inside brackets or quotes.
+
+    Plain `s.split(",")` destroys paths and prose like
+    "repo (new, commit c4675a6)" — that bug is why this exists.
+    """
+    out, buf, depth, quote = [], [], 0, ""
+    for ch in s or "":
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in "\"'":
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    if buf:
+        out.append("".join(buf).strip())
+    return [x for x in out if x]
+
+
+def flat(values, split=True):
+    """Flatten repeatable CLI options into one list."""
+    out = []
+    for v in values or []:
+        out.extend(smart_split(v) if split else [v])
+    return [x for x in out if x]
+
+
+def one(text, limit=160):
+    """Render multi-line text on a single line for compact output."""
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def path(sid, ext):
     return os.path.join(DATA, sid + ext)
 
 
+# --------------------------------------------------------------------------- storage
 def append(sid, ev):
+    """Append one event. The line is always valid JSON, even when huge."""
     os.makedirs(DATA, exist_ok=True)
-    line = json.dumps(ev, ensure_ascii=False)[:4000] + "\n"
+    line = json.dumps(ev, ensure_ascii=False)
+    if len(line) + 1 > MAX_LINE:
+        ev = shrink(ev)
+        line = json.dumps(ev, ensure_ascii=False)
+        if len(line) + 1 > MAX_LINE:
+            keep = {k: ev[k] for k in ("id", "ts", "type", "v", "session", "agent", "task")
+                    if k in ev}
+            keep["trimmed"] = True
+            keep["title"] = clip_text(ev.get("title", ""), 120)
+            keep["summary"] = clip_text(ev.get("summary", ""), 200)
+            keep["text"] = clip_text(ev.get("text", ""), 200)
+            line = json.dumps(keep, ensure_ascii=False)
     fd = os.open(path(sid, ".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
-        os.write(fd, line.encode())
+        os.write(fd, (line + "\n").encode())
     finally:
         os.close(fd)
+
+
+def shrink(ev):
+    """Reduce an oversized event while keeping it informative and valid."""
+    ev = dict(ev)
+    for key in LIST_LIMITS:
+        if isinstance(ev.get(key), list) and len(ev[key]) > 1:
+            ev[key] = ev[key][:1]
+    for key in TEXT_LIMITS:
+        if key in ev:
+            ev[key] = clip_text(ev[key], 200)
+    ev["trimmed"] = True
+    return ev
 
 
 def read_file(fn, offset=0):
@@ -94,6 +197,14 @@ def files():
         return []
 
 
+def all_events():
+    out = []
+    for fn in files():
+        evs, _ = read_file(fn)
+        out.extend(evs)
+    return out
+
+
 def open_tasks(evs):
     starts = {e["id"]: e for e in evs if e.get("type") == "start"}
     for e in evs:
@@ -111,29 +222,31 @@ def who(e):
     return "%s:%s" % (e.get("agent", "?"), e.get("session", "?")[:8])
 
 
-def fmt(e, tasks):
-    t = e.get("ts", "")[5:16].replace("T", " ")
-    if e["type"] == "start":
-        sc = ",".join(e.get("scope", []))
-        return "▶ %s %s [%s] %s%s" % (t, e["id"], who(e), e.get("title", ""), " {%s}" % sc if sc else "")
-    if e["type"] == "end":
-        st = tasks.get(e.get("task"))
-        s = "■ %s %s [%s] %s: %s" % (t, e.get("task"), who(e), e.get("status"), e.get("summary", ""))
-        if st:
-            s += " — «%s»" % st.get("title", "")
-        if e.get("changes"):
-            s += " | changed: " + ",".join(e["changes"])
-        if e.get("impact"):
-            s += " | impact: " + e["impact"]
-        return s
-    return ""
+# --------------------------------------------------------------------------- session
+def explicit_agent(args):
+    if getattr(args, "agent", None):
+        return args.agent
+    return os.environ.get("RELAY_AGENT") or None
+
+
+def session_agent(sid):
+    """Agent name recorded when this session joined — so later commands need not repeat it."""
+    evs, _ = read_file(sid + ".jsonl")
+    for e in evs:
+        if e.get("type") == "join":
+            return e.get("agent") or None
+    return None
+
+
+def resolve_agent(sid, args):
+    return explicit_agent(args) or session_agent(sid) or "agent"
 
 
 def session_id(args):
     sid = args.session or os.environ.get("RELAY_SESSION")
     new = False
     if not sid:
-        sid = "%s-%s" % (args.agent, rid())
+        sid = "%s-%s" % (explicit_agent(args) or "agent", rid())
         new = True
     return sid, new
 
@@ -144,19 +257,118 @@ def ensure_join(sid, args):
         return False
     dirty = len(git("status", "--porcelain").splitlines())
     gd, gc = git("rev-parse", "--git-dir"), git("rev-parse", "--git-common-dir")
-    append(sid, {"id": rid(), "ts": now(), "type": "join", "session": sid, "agent": args.agent,
-                 "model": args.model or "", "user": os.environ.get("USER", ""), "host": platform.node(),
-                 "pid": os.getppid(), "cwd": os.getcwd(), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-                 "head": git("rev-parse", "--short", "HEAD"), "worktree": bool(gd and gd != gc), "dirty": dirty})
+    cwd = os.getcwd()
+    append(sid, {
+        "id": rid(), "ts": now(), "type": "join", "v": SCHEMA, "session": sid,
+        "agent": explicit_agent(args) or "agent", "model": args.model or "",
+        "user": os.environ.get("USER", ""), "host": platform.node(), "pid": os.getppid(),
+        "cwd": cwd, "project": os.path.basename(cwd), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "head": git("rev-parse", "--short", "HEAD"), "worktree": bool(gd and gd != gc), "dirty": dirty,
+    })
     return True
 
 
-def sync(sid, all_=False, first=False):
-    """Print unread events from other sessions and advance the cursor.
+def base(sid, args, typ):
+    return {"id": rid(), "ts": now(), "type": typ, "v": SCHEMA, "session": sid,
+            "agent": resolve_agent(sid, args), "cwd": os.getcwd(),
+            "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "head": git("rev-parse", "--short", "HEAD")}
 
-    Nothing new means no output. ``first`` limits the first run in a session to
-    open work plus the most recently finished items, instead of full history.
-    """
+
+# --------------------------------------------------------------------------- rendering
+def fmt(e, tasks, full=False):
+    """Render one event as a list of lines."""
+    t = e.get("ts", "")[5:16].replace("T", " ")
+    typ = e.get("type")
+
+    if typ == "start":
+        lines = ["▶ %s %s [%s] %s" % (t, e["id"], who(e), e.get("title", ""))]
+        if e.get("goal"):
+            lines.append("    goal: " + (e["goal"] if full else one(e["goal"])))
+        plan = e.get("plan") or []
+        if plan:
+            if full:
+                lines.append("    plan:")
+                lines.extend("      - " + p for p in plan)
+            else:
+                shown = "; ".join(one(p, 90) for p in plan[:3])
+                extra = " …(+%d bước)" % (len(plan) - 3) if len(plan) > 3 else ""
+                lines.append("    plan: " + shown + extra)
+        sc, tg = e.get("scope") or [], e.get("tags") or []
+        if sc or tg:
+            bits = []
+            if sc:
+                bits.append("scope: " + ", ".join(sc[:6]) + (" …(+%d)" % (len(sc) - 6) if len(sc) > 6 else ""))
+            if tg:
+                bits.append("tags: " + ", ".join(tg[:6]))
+            lines.append("    " + " | ".join(bits))
+        acc = e.get("accept") or []
+        if acc:
+            lines.append("    accept: " + ("" if full else "; ".join(one(a, 90) for a in acc[:2]))
+                         + ("" if full else " …(+%d)" % (len(acc) - 2) if len(acc) > 2 else ""))
+        if e.get("refs"):
+            lines.append("    refs: " + ", ".join(e["refs"][:8]))
+        return lines
+
+    if typ == "note":
+        lines = ["  · %s %s [%s] %s" % (t, e.get("task", "?"), e.get("kind", "note"),
+                                        e.get("text", "") if full else one(e.get("text", "")))]
+        for d in (e.get("detail") or []):
+            lines.append("      - " + d)
+        return lines
+
+    if typ == "end":
+        st = tasks.get(e.get("task"))
+        title = (" — «%s»" % st.get("title", "")) if st else ""
+        lines = ["■ %s %s [%s] %s%s" % (t, e.get("task"), who(e), e.get("status"), title)]
+        if e.get("summary"):
+            lines.append("    summary: " + (e["summary"] if full else one(e["summary"])))
+        counts = []
+        for key, label in (("done", "done"), ("problems", "problems"), ("verify", "verify"),
+                           ("metrics", "metrics"), ("next", "next")):
+            items = e.get(key) or []
+            if items:
+                counts.append("%s:%d" % (label, len(items)))
+        if counts:
+            lines.append("    " + " · ".join(counts)
+                         + (" · notes:%d" % e["notes"] if e.get("notes") else "")
+                         + (" · %s" % fmt_duration(e.get("duration_s")) if e.get("duration_s") else ""))
+        for key, label in (("problems", "problems"), ("next", "next")):
+            items = e.get(key) or []
+            if items and (full or len(items) <= 3):
+                lines.append("    %s:" % label)
+                lines.extend("      - " + i for i in items)
+        if e.get("changes"):
+            lines.append("    changes: " + ", ".join(e["changes"][:6])
+                         + (" …(+%d)" % (len(e["changes"]) - 6) if len(e["changes"]) > 6 else ""))
+        if e.get("commits"):
+            lines.append("    commits: " + ", ".join(e["commits"][:5]))
+        if e.get("lessons"):
+            lines.append("    lessons: " + ", ".join(e["lessons"]))
+        if e.get("impact"):
+            lines.append("    impact: " + (e["impact"] if full else one(e["impact"])))
+        if e.get("refs"):
+            lines.append("    refs: " + ", ".join(e["refs"][:8]))
+        return lines
+
+    return []
+
+
+def fmt_duration(seconds):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm%ds" % (seconds // 60, seconds % 60)
+    return "%dh%dm" % (seconds // 3600, (seconds % 3600) // 60)
+
+
+# --------------------------------------------------------------------------- sync
+def sync(sid, all_=False, first=False, full=False, only=None):
+    """Print unread events from other sessions and advance the cursor."""
     cur_p = path(sid, ".cursor")
     try:
         cur = json.load(open(cur_p))
@@ -164,6 +376,9 @@ def sync(sid, all_=False, first=False):
         cur = {}
     mine, _ = read_file(sid + ".jsonl")
     my_scope = [s for t in open_tasks(mine) for s in t.get("scope", [])]
+    my_tags = set()
+    for t in open_tasks(mine):
+        my_tags.update(t.get("tags", []))
     allev, new = {}, []
     for fn in files():
         evs, off = read_file(fn)  # full read so task titles are available
@@ -180,40 +395,100 @@ def sync(sid, all_=False, first=False):
     tasks = {e["id"]: e for evs in allev.values() for e in evs if e.get("type") == "start"}
     if first and not all_:
         others = [e for fn, evs in allev.items() if fn != sid + ".jsonl" for e in evs]
-        new = open_tasks(others)
-        done = [e for e in others if e.get("type") == "end"][-RECENT_DONE:]
-        new += done
-    new = [e for e in new if e.get("type") in ("start", "end")]
+        open_ids = {t["id"] for t in open_tasks(others)}
+        done_events = [e for e in others if e.get("type") == "end"][-RECENT_DONE:]
+        done_ids = {e.get("task") for e in done_events}
+        new = [e for e in others if e.get("type") == "start" and e["id"] in open_ids]
+        new += [e for e in others if e.get("type") == "note" and e.get("task") in open_ids]
+        # the plan/goal of a finished task is context worth showing too
+        new += [e for e in others if e.get("type") == "start" and e["id"] in done_ids]
+        new += [e for e in others if e.get("type") == "note" and e.get("task") in done_ids]
+        new += done_events
+    new = [e for e in new if e.get("type") in ("start", "note", "end")]
+    if only:
+        new = [e for e in new if e.get("task") == only or e.get("id") == only]
     new.sort(key=lambda e: e.get("ts", ""))
     if not all_:
         os.makedirs(DATA, exist_ok=True)
         json.dump(cur, open(cur_p, "w"))
     if not new:
         return
-    hot = lambda e: overlap(my_scope, e.get("scope", []) or e.get("changes", []))
+    hot = lambda e: (overlap(my_scope, e.get("scope", []) or e.get("changes", []))
+                     or bool(my_tags & set(e.get("tags", []))))
     lines = []
     for e in sorted(new, key=lambda e: not hot(e)):  # stable sort: overlapping scope first
-        line = fmt(e, tasks)
-        if line:
-            lines.append(("! " if hot(e) else "  ") + line)
+        block = fmt(e, tasks, full)
+        if block:
+            lines.append(("! " if hot(e) else "  ") + block[0])
+            lines.extend(block[1:])
     stale = {e["id"] for evs in allev.values() for e in open_tasks(evs) if age_h(e["ts"]) > STALE_H}
     lines = [l + ("  (possibly abandoned)" if any(i in l for i in stale) and "▶" in l else "") for l in lines]
     print(NOTE)
     if not all_ and len(lines) > CAP:
         extra = len(lines) - CAP
-        lines = lines[:CAP] + ["  … +%d more events (relay sync --all)" % extra]
+        lines = lines[:CAP] + ["  … +%d more lines (relay sync --all)" % extra]
     print("\n".join(lines))
 
 
-def base(sid, args, typ):
-    return {"id": rid(), "ts": now(), "type": typ, "session": sid, "agent": args.agent,
-            "cwd": os.getcwd(), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-            "head": git("rev-parse", "--short", "HEAD")}
+# --------------------------------------------------------------------------- show
+def find_task(task_id):
+    """Return (start_event, [notes], end_event) for a task id, searching every session."""
+    start = notes = end = None
+    for ev in all_events():
+        if ev.get("type") == "start" and ev.get("id") == task_id:
+            start = ev
+        elif ev.get("type") == "note" and ev.get("task") == task_id:
+            notes = (notes or []) + [ev]
+        elif ev.get("type") == "end" and ev.get("task") == task_id:
+            end = ev
+    return start, notes or [], end
 
 
+def render_task(start, notes, end, as_json=False):
+    if as_json:
+        for ev in ([start] if start else []) + notes + ([end] if end else []):
+            print(json.dumps(ev, ensure_ascii=False, indent=2))
+        return
+    out = []
+    title = (start or {}).get("title") or (end or {}).get("task") or "?"
+    status = (end or {}).get("status") or "in progress"
+    out.append("TASK %s  [%s]" % ((start or end or {}).get("id", "?"), status))
+    out.append("  title:    %s" % title)
+    out.append("  agent:    %s   session: %s" % ((start or end or {}).get("agent", "?"),
+                                                (start or end or {}).get("session", "?")))
+    out.append("  started:  %s" % ((start or {}).get("ts", "?")))
+    if end:
+        out.append("  ended:    %s   (%s)" % (end.get("ts", "?"), fmt_duration(end.get("duration_s"))))
+    for key, label in (("goal", "goal"), ("summary", "summary"), ("impact", "impact")):
+        src = start if key == "goal" else end
+        val = (src or {}).get(key)
+        if val:
+            out.append("  %s: %s" % (label, val))
+    for key, label in (("plan", "plan"), ("accept", "accept"), ("outs", "out of scope"),
+                       ("done", "done"), ("problems", "problems"), ("verify", "verify"),
+                       ("metrics", "metrics"), ("next", "next")):
+        items = (start or {}).get(key) or (end or {}).get(key) or []
+        if items:
+            out.append("  %s:" % label)
+            out.extend("    - %s" % i for i in items)
+    for key, label in (("scope", "scope"), ("tags", "tags"), ("changes", "changes"),
+                       ("commits", "commits"), ("lessons", "lessons"), ("refs", "refs")):
+        items = (start or {}).get(key) or (end or {}).get(key) or []
+        if items:
+            out.append("  %s: %s" % (label, ", ".join(items)))
+    if notes:
+        out.append("  notes (%d):" % len(notes))
+        for n in notes:
+            out.append("    [%s] %s" % (n.get("kind", "note"), n.get("text", "")))
+            for d in (n.get("detail") or []):
+                out.append("      - %s" % d)
+    print("\n".join(out))
+
+
+# --------------------------------------------------------------------------- doctor
 def doctor():
     """Print a quick health check. Never raises for missing data."""
-    print("relay %s" % VERSION)
+    print("relay %s (schema %d)" % (VERSION, SCHEMA))
     print("root: %s" % ROOT)
     print("data: %s (%s)" % (DATA, "exists" if os.path.isdir(DATA) else "not created yet"))
     try:
@@ -231,58 +506,207 @@ def doctor():
     print("sessions: %d" % len(fs))
     for fn in fs:
         evs, _ = read_file(fn)
-        print("  %s: %d events, %d open" % (fn[:-6], len(evs), len(open_tasks(evs))))
+        kinds = {}
+        for e in evs:
+            kinds[e.get("type", "?")] = kinds.get(e.get("type", "?"), 0) + 1
+        print("  %s: %d events (%s), %d open" % (fn[:-6], len(evs),
+              ", ".join("%s:%d" % kv for kv in sorted(kinds.items())), len(open_tasks(evs))))
+
+
+# --------------------------------------------------------------------------- CLI
+def add_list_arg(p, name, help_text):
+    p.add_argument("--" + name, action="append", default=[], help=help_text)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="relay", description="Cross-agent work log.")
+    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("--session", help="session id (else $RELAY_SESSION)")
+    p.add_argument("--agent", help="agent name (else $RELAY_AGENT, else the session's own name)")
+    p.add_argument("--model", default=os.environ.get("RELAY_MODEL", ""))
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start", help="open a task: what will be done and how")
+    s.add_argument("title", help="one-line label (≤120 chars)")
+    s.add_argument("--goal", default="", help="what and why (≤600 chars, multi-line ok)")
+    add_list_arg(s, "plan", "one step of the plan (repeatable)")
+    add_list_arg(s, "accept", "acceptance criteria / definition of done (repeatable)")
+    add_list_arg(s, "out", "explicitly out of scope (repeatable)")
+    add_list_arg(s, "scope", "paths expected to be touched (repeatable, comma ok)")
+    add_list_arg(s, "tags", "keywords to make the work findable (repeatable, comma ok)")
+    add_list_arg(s, "refs", "codes/URLs: T-65, L-42, #123 (repeatable, comma ok)")
+
+    n = sub.add_parser("note", help="log progress, a problem, a decision, a result, a blocker")
+    n.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
+    n.add_argument("--kind", default="progress", choices=list(KINDS))
+    n.add_argument("--text", required=True, help="what happened (≤600 chars, multi-line ok)")
+    add_list_arg(n, "detail", "extra lines: error output, measurements, context (repeatable)")
+    add_list_arg(n, "refs", "codes/URLs (repeatable, comma ok)")
+
+    e = sub.add_parser("end", help="close a task: what was done, problems, verification, next")
+    e.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
+    e.add_argument("--status", default="done", choices=["done", "partial", "abandoned", "blocked"])
+    e.add_argument("--summary", default="", help="dense summary of the outcome (≤1000 chars)")
+    add_list_arg(e, "done", "a step that was actually completed (repeatable)")
+    add_list_arg(e, "problem", "problem → resolution, or problem (UNRESOLVED) (repeatable)")
+    add_list_arg(e, "verify", "how it was verified and the result (repeatable)")
+    add_list_arg(e, "metric", "before → after (n=…, window=…) (repeatable)")
+    add_list_arg(e, "changes", "files/dirs changed (repeatable, comma ok)")
+    add_list_arg(e, "commit", "commit sha (repeatable, comma ok)")
+    add_list_arg(e, "next", "open item / next step (repeatable)")
+    add_list_arg(e, "lesson", "lesson code, e.g. L-42 (repeatable, comma ok)")
+    add_list_arg(e, "refs", "codes/URLs (repeatable, comma ok)")
+    e.add_argument("--impact", default="", help="what the next person must know (≤600 chars)")
+
+    y = sub.add_parser("sync", help="print what other sessions did since your last sync")
+    y.add_argument("--all", action="store_true", help="full history, do not advance the cursor")
+    y.add_argument("--full", action="store_true", help="print fields in full, not compacted")
+    y.add_argument("--task", help="only this task id")
+
+    sh = sub.add_parser("show", help="print one task in full (all fields, all notes)")
+    sh.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
+    sh.add_argument("--json", action="store_true", help="raw JSON events")
+
+    sub.add_parser("doctor", help="health check")
+    sub.add_parser("version", help="print the version")
+    return p
+
+
+def pick_task(sid, args, allow_last=False):
+    """Find the task id to act on.
+
+    Order: explicit id → open task of this session → single open task of this
+    agent → (only for read-only commands) the most recent task overall.
+    """
+    if getattr(args, "task", None):
+        return args.task
+    mine, _ = read_file(sid + ".jsonl")
+    opn = open_tasks(mine)
+    if opn:
+        return opn[-1]["id"]
+    agent = resolve_agent(sid, args)
+    cands = []
+    for fn in files():
+        evs, _ = read_file(fn)
+        join = next((e for e in evs if e.get("type") == "join"), {})
+        if join.get("agent") != agent:
+            continue
+        for t in open_tasks(evs):
+            cands.append(t)
+    if len(cands) == 1:
+        return cands[0]["id"]
+    if len(cands) > 1:
+        print("[relay] nhiều việc đang dở của agent '%s', chọn rõ task id: %s"
+              % (agent, ", ".join(t["id"] for t in cands)), file=sys.stderr)
+        return None
+    if allow_last:
+        ids = [e.get("id") for e in all_events() if e.get("type") == "start"]
+        if ids:
+            return ids[-1]
+    return None
 
 
 def main():
-    p = argparse.ArgumentParser(prog="relay")
-    p.add_argument("--version", action="version", version=VERSION)
-    p.add_argument("--session")
-    p.add_argument("--agent", default=os.environ.get("RELAY_AGENT", "agent"))
-    p.add_argument("--model", default=os.environ.get("RELAY_MODEL", ""))
-    sub = p.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("start"); s.add_argument("title"); s.add_argument("--scope", default="")
-    e = sub.add_parser("end"); e.add_argument("task", nargs="?")
-    e.add_argument("--status", default="done", choices=["done", "partial", "abandoned", "blocked"])
-    e.add_argument("--summary", default=""); e.add_argument("--changes", default=""); e.add_argument("--impact", default="")
-    y = sub.add_parser("sync"); y.add_argument("--all", action="store_true")
-    sub.add_parser("doctor")
-    sub.add_parser("version")
-    a = p.parse_args()
+    args = build_parser().parse_args()
 
-    if a.cmd == "version":
+    if args.cmd == "version":
         print(VERSION)
         return
-    if a.cmd == "doctor":
+    if args.cmd == "doctor":
         doctor()
         return
 
-    sid, gen = session_id(a)
-    first = ensure_join(sid, a)
+    sid, gen = session_id(args)
+    read_only = args.cmd == "show"
+    first = False
+    if read_only:
+        # read-only commands must not create a stray session file
+        first = ensure_join(sid, args) if os.path.exists(path(sid, ".jsonl")) else False
+    else:
+        first = ensure_join(sid, args)
     if gen:
         print("session=%s  (reuse: --session %s or RELAY_SESSION)" % (sid, sid))
-    if a.cmd == "sync":
-        sync(sid, a.all, first)
-    elif a.cmd == "start":
+
+    if args.cmd == "sync":
+        sync(sid, args.all, first, args.full, args.task)
+    elif args.cmd == "show":
+        task = pick_task(sid, args, allow_last=True)
+        if not task:
+            print("[relay] không tìm thấy task; truyền rõ task id", file=sys.stderr)
+            return
+        start, notes, end = find_task(task)
+        render_task(start, notes, end, args.json)
+    elif args.cmd == "start":
         sync(sid, first=first)
-        scope = split(a.scope)
-        ev = base(sid, a, "start"); ev.update(title=clip(a.title), scope=clip(scope))
+        scope = flat(args.scope)
+        ev = base(sid, args, "start")
+        ev.update({
+            "title": clip_text(args.title, TEXT_LIMITS["title"]) or "untitled",
+            "goal": clip_text(args.goal, TEXT_LIMITS["goal"]),
+            "plan": clip_list(args.plan, *LIST_LIMITS["plan"]),
+            "accept": clip_list(args.accept, *LIST_LIMITS["accept"]),
+            "outs": clip_list(args.out, *LIST_LIMITS["outs"]),
+            "scope": clip_list(scope, *LIST_LIMITS["scope"]),
+            "tags": clip_list(flat(args.tags), *LIST_LIMITS["tags"]),
+            "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
+            "status": "planned",
+        })
         clash = [t for fn in files() if fn != sid + ".jsonl" for t in open_tasks(read_file(fn)[0])
                  if overlap(scope, t.get("scope", []))]
         append(sid, ev)
         print("task=%s" % ev["id"])
         for t in clash:
             print("! scope overlaps open work [%s] %s: %s" % (who(t), t["id"], t.get("title", "")))
-    elif a.cmd == "end":
-        mine, _ = read_file(sid + ".jsonl")
-        opn = open_tasks(mine)
-        t = a.task or (opn[-1]["id"] if opn else None)
-        if not t:
-            print("[relay] no open task to finish", file=sys.stderr); return
-        ev = base(sid, a, "end")
-        ev.update(task=t, status=a.status, summary=clip(a.summary), changes=clip(split(a.changes)), impact=clip(a.impact))
+    elif args.cmd == "note":
+        task = pick_task(sid, args)
+        if not task:
+            print("[relay] không có task để ghi note; truyền rõ task id", file=sys.stderr)
+            return
+        ev = base(sid, args, "note")
+        ev.update({
+            "task": task,
+            "kind": args.kind,
+            "text": clip_text(args.text, TEXT_LIMITS["text"]),
+            "detail": clip_list(args.detail, *LIST_LIMITS["detail"]),
+            "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
+        })
         append(sid, ev)
-        print("ended=%s" % t)
+        print("note=%s task=%s" % (ev["id"], task))
+    elif args.cmd == "end":
+        task = pick_task(sid, args)
+        if not task:
+            print("[relay] không có việc đang dở để kết thúc", file=sys.stderr)
+            return
+        start, notes, _end = find_task(task)
+        duration = 0
+        if start:
+            try:
+                t0 = datetime.strptime(start["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                duration = int((datetime.now(timezone.utc) - t0).total_seconds())
+            except (KeyError, ValueError):
+                duration = 0
+        ev = base(sid, args, "end")
+        ev.update({
+            "task": task,
+            "status": args.status,
+            "summary": clip_text(args.summary, TEXT_LIMITS["summary"]),
+            "done": clip_list(args.done, *LIST_LIMITS["done"]),
+            "problems": clip_list(args.problem, *LIST_LIMITS["problems"]),
+            "verify": clip_list(args.verify, *LIST_LIMITS["verify"]),
+            "metrics": clip_list(args.metric, *LIST_LIMITS["metrics"]),
+            "changes": clip_list(flat(args.changes), *LIST_LIMITS["changes"]),
+            "commits": clip_list(flat(args.commit), *LIST_LIMITS["commits"]),
+            "impact": clip_text(args.impact, TEXT_LIMITS["impact"]),
+            "next": clip_list(args.next, *LIST_LIMITS["next"]),
+            "lessons": clip_list(flat(args.lesson), *LIST_LIMITS["lessons"]),
+            "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
+            "duration_s": duration,
+            "notes": len(notes),
+        })
+        append(sid, ev)
+        print("ended=%s status=%s duration=%s notes=%d"
+              % (task, ev["status"], fmt_duration(duration), len(notes)))
         sync(sid)
 
 

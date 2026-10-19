@@ -16,7 +16,7 @@ replaces one marker block:
 
 | Path | Change |
 |---|---|
-| `.relay/relay` | CLI copied from `package/relay` |
+| `.relay/relay` | CLI copied from `package/relay` (schema v2) |
 | `.relay/README.md`, `.relay/SNIPPET.md` | Runtime docs |
 | `.relay/install.json` | Install manifest (local, git-ignored) |
 | `.gitignore` | Adds `.relay/` if neither `.relay` nor `.relay/` is present |
@@ -65,7 +65,7 @@ Useful flags:
 | Flag | Effect |
 |---|---|
 | `--backup` | Writes `AGENTS.md.relay-backup-<timestamp>` / `CLAUDE.md.relay-backup-<timestamp>` before editing |
-| `--force` | Updates existing `.relay/relay`, `README.md`, `SNIPPET.md` (never `data/`) |
+| `--force` | Updates existing `.relay/relay`, `README.md`, `SNIPPET.md` (never `data/`) — required to upgrade an older runtime |
 | `--skip-agents` | Do not touch `AGENTS.md` |
 | `--skip-claude` | Do not touch `CLAUDE.md` |
 | `--no-create` | Do not create a missing `AGENTS.md` / `CLAUDE.md` |
@@ -73,6 +73,17 @@ Useful flags:
 
 Installation is idempotent: running it again replaces the block instead of
 adding a second one.
+
+**Upgrading an existing installation:** if the target already has `.relay/`, the
+runtime files are kept unless `--force` is given. The install output says which
+version is installed and which one the package provides, e.g.
+`relay: kept existing (v1.0.0; use --force to update to v2.0.0)`. Upgrade with:
+
+```bash
+./scripts/install.sh --target /path/to/project --force --backup
+```
+
+`.relay/data` (the existing log) is never touched by an upgrade.
 
 ## Step 3 — verify
 
@@ -82,11 +93,18 @@ TARGET=/path/to/project
 # Structure and marker check
 "$TARGET/.relay/relay" doctor
 
-# Exercise the CLI end to end
+# Exercise the CLI end to end (start → note → end → show)
 SID="verify-$(date +%s)"
-"$TARGET/.relay/relay" --agent verify --session "$SID" start "verify install"
-"$TARGET/.relay/relay" --agent verify --session "$SID" sync
-"$TARGET/.relay/relay" --agent verify --session "$SID" end --status done --summary "install verified"
+"$TARGET/.relay/relay" --agent verify --session "$SID" start "verify install" \
+  --goal "check the runtime works" --plan "start, note, end" --scope .relay
+"$TARGET/.relay/relay" --agent verify --session "$SID" note --kind progress \
+  --text "runtime responds" --detail "version: $("$TARGET/.relay/relay" --version)"
+"$TARGET/.relay/relay" --agent verify --session "$SID" end --status done \
+  --summary "install verified" --done "start/note/end cycle" \
+  --verify "relay doctor + show" --impact "nothing"
+
+# Read one task back in full
+"$TARGET/.relay/relay" --session "$SID" show
 
 # Marker counts: each must be exactly 1
 grep -cF '<!-- BEGIN relay-logs -->' "$TARGET/AGENTS.md"
@@ -98,9 +116,10 @@ grep -nF '.relay/' "$TARGET/.gitignore"
 
 Expected:
 
-- `relay doctor` reports `result: OK`.
-- `start` prints `task=…`; `sync` prints the verification task; `end` prints
-  `ended=…`.
+- `relay doctor` reports `relay 2.0.0 (schema 2)` and `result: OK`.
+- `start` prints `task=…`; `note` prints `note=… task=…`; `end` prints
+  `ended=… status=done duration=… notes=1`.
+- `show` prints the goal, the plan, the note and the verification.
 - Each `grep -c` prints `1`.
 - `.gitignore` contains `.relay/`.
 

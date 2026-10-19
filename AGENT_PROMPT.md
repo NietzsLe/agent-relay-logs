@@ -25,9 +25,13 @@ Do this:
 2. Inspect /path/to/target: existing AGENTS.md, CLAUDE.md, .gitignore, and
    whether .relay/ already exists. Do not delete anything you find.
 3. Run: /path/to/agent-relay-logs/scripts/install.sh --target /path/to/target --dry-run
-   and read the output before doing anything else.
+   and read the output before doing anything else. If it says the runtime is
+   older than the package, re-run the real install with --force.
 4. Run the same command without --dry-run (add --backup).
-5. Verify: /path/to/target/.relay/relay doctor, and one start/sync/end cycle.
+5. Verify: /path/to/target/.relay/relay doctor, and one
+   start → note → end → show cycle (the runtime is schema v2: start carries
+   goal/plan/accept/scope, note records progress/problems while working, end
+   carries done/problems/verify/metrics/next/impact).
 6. Show the git diff of AGENTS.md, CLAUDE.md and .gitignore. Do not commit
    unless I ask, and never commit .relay/.
 

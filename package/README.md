@@ -1,9 +1,9 @@
-# `.relay` — per-session work log for multiple agents
+# `.relay` — per-session work log for multiple agents (schema v2)
 
-A small, self-contained system that can be copied into another project. Its goal:
+A small, self-contained system that can be copied into another project. Goal:
 agent sessions (Claude, OpenCode, Codex, …) working in the same repository can
-see what was **started** and **finished** in other sessions, so they understand
-the environment without asking the user again.
+see **what each session planned, what it hit, and what it left behind** — so
+they understand the environment without asking the user again.
 
 ## Scope: local only
 
@@ -11,39 +11,104 @@ the environment without asking the user again.
 git** (the directory is ignored), so other machines or clones do not see each
 other's logs. Do not treat it as a source of truth for other people/machines.
 
+## Why the log is detailed
+
+A log that only says *"task X started"* is useless to the next session. Every
+event type therefore carries the context that a reader needs:
+
+| Event | Answers | Fields |
+|---|---|---|
+| `join` | Who/where am I? | agent, model, user, host, pid, cwd, project, branch, head, worktree, dirty |
+| `start` | **What will be done, how, and how is it judged done?** | title, goal, plan, accept, outs, scope, tags, refs |
+| `note` | **What is happening right now, what went wrong, what was decided?** | task, kind (progress/problem/decision/result/blocker/question), text, detail, refs |
+| `end` | **What was done, what broke, how was it verified, what is left?** | status, summary, done, problems, verify, metrics, changes, commits, impact, next, lessons, refs, duration_s, notes |
+
+The `note` type is what makes a long task legible: an agent that works for an
+hour can record a problem at minute 10 instead of only reporting at the end.
+
 ## Model
 
 - Each session writes to its own append-only file `data/<session>.jsonl`
-  (one writer per file, so sessions do not collide).
-- Events: `join` (session profile: agent, model, user, host, pid, cwd, branch,
-  head, worktree, dirty) · `start` (title, scope) · `end` (task, status,
-  summary, changes, impact). Every event carries `session, agent, cwd, branch,
-  head`.
-- **A `start` without an `end` means work is still in progress.** Work older
-  than 12 hours (`RELAY_STALE_HOURS`) is labelled "possibly abandoned".
+  (one writer per file, so sessions never collide).
+- Every event carries `id, ts, type, v (schema version), session, agent, cwd,
+  branch, head`.
+- **`start` without `end` means work is still in progress.** Work older than 12
+  hours (`RELAY_STALE_HOURS`) is labelled "possibly abandoned".
 - **Read cursor** for each session: `data/<session>.cursor` (byte offset already
   read in each other session's file). `sync` prints only unread events and
-  advances the cursor; nothing new means no output (saves tokens). Items whose
-  `scope` overlaps the current session's open work are marked `!` and sorted
-  first.
-- First run in a session: only open work plus roughly the last 10 finished
-  items, not the whole history. See everything with `relay sync --all` (does not
-  advance the cursor).
+  advances the cursor; nothing new means no output (saves tokens). Events whose
+  `scope` or `tags` overlap the current session's open work are marked `!` and
+  sorted first.
+- First run in a session: open work, the notes attached to it, the last ~10
+  finished tasks and their plans. Not the whole history — `sync --all` shows
+  everything without advancing the cursor.
+- The **agent name is inherited** from the session's `join` event, so
+  `relay --session <id> end ...` no longer records the agent as "agent".
+- Lists are parsed with a bracket/quote-aware splitter: `--changes "a.py,b.py"`
+  and `--changes "repo (new, commit abc)"` both survive.
+- Every event line is valid JSON, even when oversized: oversized events are
+  trimmed and flagged with `"trimmed": true` instead of being cut mid-object.
+- Old (schema v1) events are still readable and still render.
 
 ## Commands
 
 ```text
-relay [--session ID] [--agent NAME] [--model M] start "title" [--scope a,b]
-relay [--session ID] end [TASK] --status done|partial|abandoned|blocked --summary ".." [--changes a,b] [--impact ".."]
-relay [--session ID] sync [--all]
+relay [--session ID] [--agent NAME] [--model M] start "title"
+      [--goal TEXT] [--plan TEXT]... [--accept TEXT]... [--out TEXT]...
+      [--scope a,b]... [--tags a,b]... [--refs a,b]...
+
+relay [--session ID] note [TASK]
+      --kind progress|problem|decision|result|blocker|question
+      --text TEXT [--detail TEXT]... [--refs a,b]...
+
+relay [--session ID] end [TASK] --status done|partial|abandoned|blocked
+      [--summary TEXT] [--done TEXT]... [--problem TEXT]... [--verify TEXT]...
+      [--metric TEXT]... [--changes a,b]... [--commit sha]... [--next TEXT]...
+      [--lesson L-nn]... [--refs a,b]... [--impact TEXT]
+
+relay [--session ID] sync [--all] [--full] [--task ID]
+relay [--session ID] show [TASK] [--json]
 relay doctor
 relay version
 ```
 
-Without `--session`/`$RELAY_SESSION`, a session id is generated and printed
-(`session=…`); later commands must pass it back. `end` without `TASK` finishes the
-most recent open task of the session. Relay errors never block the main work
-(printed to stderr, exit 0). Event lines are capped at 4 KB.
+- Without `--session`/`$RELAY_SESSION`, a session id is generated and printed
+  (`session=…`); later commands must pass it back. `$RELAY_AGENT` and
+  `$RELAY_MODEL` are honoured.
+- `end`/`note` without a task id use the open task of the session; if the
+  session has none, the single open task of the same agent is used, otherwise
+  the command refuses and lists the candidates.
+- `show` prints one task in full (plan, notes, problems, verification, next).
+- Relay errors never block the main work (printed to stderr, exit 0).
+
+## What to write in each field
+
+```text
+start  title   one line, ≤120 chars: "Sửa N+1 ở trang danh sách bất động sản"
+       goal    what and why, in 1–3 sentences
+       plan    the steps you will take, in order
+       accept  how "done" is judged (test xanh? số đo? tài liệu?)
+       scope   paths you expect to touch  → other agents avoid the same files
+       tags    keywords (perf, db, deploy) → other agents can find your work
+       outs    explicitly out of scope
+
+note   kind=problem   what broke, what you tried, what it costs
+       kind=decision  a choice you made and why
+       kind=result    a measured outcome
+       kind=blocker   what you need from whom
+       text   one paragraph; detail lines for raw output/measurements
+
+end    summary   dense: what the world looks like now
+       done      steps actually completed
+       problems  every problem hit → how it was resolved (mark UNRESOLVED)
+       verify    how you checked it + the result
+       metrics   before → after (n=…, window=…, condition)
+       changes   files/dirs touched
+       commits   commit shas
+       impact    what the next person must know
+       next      open items / next steps
+       lessons   lesson codes (L-nn) if you wrote one
+```
 
 ## Limits (important)
 
@@ -64,5 +129,6 @@ decides whether it is worth mentioning in the response.
 ## Install / uninstall
 
 See the `agent-relay-logs` repository: `INSTALL.md` and `UNINSTALL.md`. The
-short version is to run `scripts/install.sh` / `scripts/uninstall.sh` from that
-repository with `--target <project>`.
+short version: `scripts/install.sh` / `scripts/uninstall.sh` with
+`--target <project>`. Upgrading an existing installation to a newer runtime
+needs `--force` (the runtime file is replaced, `data/` is never touched).

@@ -30,13 +30,24 @@ Only four paths are touched:
 
 | Path | Change |
 |---|---|
-| `.relay/` | Runtime: `relay` CLI, `README.md`, `SNIPPET.md`; later `data/` and `install.json` |
+| `.relay/` | Runtime: `relay` CLI (schema v2), `README.md`, `SNIPPET.md`; later `data/` and `install.json` |
 | `.gitignore` | Adds `.relay/` (if missing) |
 | `AGENTS.md` | Inserts/replaces one `<!-- BEGIN relay-logs -->` … `<!-- END relay-logs -->` block |
 | `CLAUDE.md` | Inserts/replaces the same kind of block |
 
 The marker block is the whole uninstall contract: remove the block and the
 instructions are gone. Existing project content is never replaced wholesale.
+
+## What an agent is asked to log
+
+The installed block is not "call `start`, call `end`" — it asks for detail,
+because a log of *"task X started"* tells the next session nothing:
+
+| Event | Required content |
+|---|---|
+| `start` | `--goal` (what and why), `--plan` (steps), `--accept` (how done is judged), `--scope` (files to touch), `--tags` (keywords) |
+| `note` | `--kind progress\|problem\|decision\|result\|blocker` + `--text` + `--detail` (raw output, numbers, errors) — used *while* working |
+| `end` | `--summary`, `--done`, `--problem` (problem → resolution), `--verify`, `--metric` (before → after with n and window), `--changes`, `--commit`, `--next`, `--lesson`, `--impact` |
 
 ## Quick start (human)
 
@@ -105,18 +116,27 @@ agent-relay-logs/
 
 - One JSONL file per session: `.relay/data/<session>.jsonl`. Append-only, one
   writer per file, so sessions do not collide.
-- Events: `join` (session profile), `start` (title, scope), `end` (task, status,
-  summary, changes, impact). Each line is capped at 4 KB.
+- Four event types, each carrying the detail a reader needs:
+
+  | Event | Answers | Fields |
+  |---|---|---|
+  | `join` | who/where am I? | agent, model, user, host, pid, cwd, project, branch, head, worktree, dirty |
+  | `start` | **what will be done, how, and how is it judged done?** | title, goal, plan, accept, outs, scope, tags, refs |
+  | `note` | **what is happening now, what broke, what was decided?** | task, kind (progress/problem/decision/result/blocker/question), text, detail, refs |
+  | `end` | **what was done, what broke, how was it verified, what is left?** | status, summary, done, problems, verify, metrics, changes, commits, impact, next, lessons, refs, duration_s, notes |
+
+  The `note` type is what makes a long task legible: an agent working for an
+  hour records a problem at minute 10 instead of only reporting at the end.
 - Each session has a cursor: `.relay/data/<session>.cursor` stores the byte
   offset read in every other session's file. `sync` prints only unread events and
   advances the cursor; nothing new means no output.
-- First `sync` in a session shows open work plus roughly the last 10 finished
-  items, not the whole history. `sync --all` shows everything without advancing
-  the cursor.
+- First `sync` in a session shows open work, the notes attached to it, and the
+  last ~10 finished tasks with their plans — not the whole history. `sync --all`
+  shows everything without advancing the cursor.
 - A `start` older than 12 hours (`RELAY_STALE_HOURS`) with no matching `end` is
   labelled "possibly abandoned".
-- Events whose `scope` overlaps the current session's open work are marked `!`
-  and sorted first.
+- Events whose `scope` or `tags` overlap the current session's open work are
+  marked `!` and sorted first.
 
 ## Design guarantees
 
@@ -126,7 +146,19 @@ agent-relay-logs/
   block. Unbalanced markers are refused instead of guessed.
 - **Idempotent.** Running install twice still leaves exactly one block.
 - **Data-preserving.** Install never deletes `.relay/data`; uninstall moves it
-  aside by default.
+  aside by default. Upgrading a runtime needs `--force` and still keeps `data/`.
+- **Valid JSON always.** An oversized event is trimmed and flagged
+  (`"trimmed": true`) instead of being cut mid-object, so the log never
+  contains an unparseable line.
+- **Correct attribution.** The agent name is inherited from the session's
+  `join` event, so `relay --session <id> end …` no longer records the agent as
+  "agent".
+- **Robust parsing.** List options are split on commas that are not inside
+  brackets or quotes, so `--changes "repo (new, commit abc)"` survives.
+- **Readable.** `relay show <task>` prints one task in full; `relay sync --full`
+  prints fields uncompacted.
+- **Backwards compatible.** Schema v1 events still render; v2 events carry
+  `"v": 2`.
 - **No dependencies.** Python 3 standard library and POSIX `sh` only. `git` is
   optional (used for context fields when available).
 - **No secrets.** The docs and CLI tell agents not to log secrets/PII. There is

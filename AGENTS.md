@@ -20,6 +20,23 @@ When a user gives you this repository and a target project, install the system
 into that target **without destroying existing content**, verify it, and report
 exactly what changed.
 
+## The log contract (applies to any change of the runtime)
+
+- Every event type must carry the detail a reader needs:
+  `start` = goal/plan/accept/scope/tags · `note` = kind/text/detail ·
+  `end` = summary/done/problems/verify/metrics/changes/commits/next/lessons/impact.
+  A log of "task X started" is worth nothing to the next session.
+- One line must always be valid JSON. Oversized events are trimmed and flagged
+  (`"trimmed": true`) — never cut mid-object.
+- Schema v1 events must stay readable; new fields are optional and additive.
+- The agent name is inherited from the session's `join` event, so later commands
+  do not have to repeat `--agent`.
+- List options are split on commas that are not inside brackets or quotes
+  (`--changes "repo (new, commit abc)"` must survive).
+- Any runtime change needs a matching test in `tests/test.sh`.
+- When you use the relay yourself (in any project), log with the same detail —
+  a half-empty log teaches the next session the wrong habit.
+
 ## Hard rules
 
 - Touch only these paths in the target: `.relay/`, `.gitignore`, `AGENTS.md`,
@@ -45,6 +62,9 @@ exactly what changed.
 ./scripts/install.sh --target /path/to/project --dry-run
 ./scripts/install.sh --target /path/to/project --backup
 ```
+
+To **upgrade an existing installation** (older runtime in `.relay/relay`), add
+`--force`: the runtime files are replaced, `.relay/data` is never touched.
 
 Then follow the verification steps in `INSTALL.md`. Commit only the target's
 `AGENTS.md`, `CLAUDE.md`, and `.gitignore` changes. Do not commit `.relay/`.
