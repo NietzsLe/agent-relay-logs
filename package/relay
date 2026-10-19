@@ -573,11 +573,13 @@ def build_parser():
     return p
 
 
-def pick_task(sid, args, allow_last=False):
+def pick_task(sid, args, allow_last=False, allow_session_last=False):
     """Find the task id to act on.
 
     Order: explicit id → open task of this session → single open task of this
-    agent → (only for read-only commands) the most recent task overall.
+    agent → the most recent task of this session (only for notes, so a
+    correction can still be attached after the task was closed) → (only for
+    read-only commands) the most recent task overall.
     """
     if getattr(args, "task", None):
         return args.task
@@ -600,6 +602,10 @@ def pick_task(sid, args, allow_last=False):
         print("[relay] nhiều việc đang dở của agent '%s', chọn rõ task id: %s"
               % (agent, ", ".join(t["id"] for t in cands)), file=sys.stderr)
         return None
+    if allow_session_last:
+        started = [e for e in mine if e.get("type") == "start"]
+        if started:
+            return started[-1]["id"]
     if allow_last:
         ids = [e.get("id") for e in all_events() if e.get("type") == "start"]
         if ids:
@@ -659,7 +665,7 @@ def main():
         for t in clash:
             print("! scope overlaps open work [%s] %s: %s" % (who(t), t["id"], t.get("title", "")))
     elif args.cmd == "note":
-        task = pick_task(sid, args)
+        task = pick_task(sid, args, allow_session_last=True)
         if not task:
             print("[relay] không có task để ghi note; truyền rõ task id", file=sys.stderr)
             return

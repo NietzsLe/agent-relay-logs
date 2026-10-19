@@ -77,7 +77,9 @@ relay version
   `$RELAY_MODEL` are honoured.
 - `end`/`note` without a task id use the open task of the session; if the
   session has none, the single open task of the same agent is used, otherwise
-  the command refuses and lists the candidates.
+  the command refuses and lists the candidates. `note` falls back to the most
+  recent task of the session, so a correction can still be attached after the
+  task was closed.
 - `show` prints one task in full (plan, notes, problems, verification, next).
 - Relay errors never block the main work (printed to stderr, exit 0).
 

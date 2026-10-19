@@ -177,6 +177,18 @@ OUT=$(./.relay/relay --agent reader --session "reader-$$" sync)
 echo "$OUT" | grep -q "deadlock in migrate" || fail "sync did not show the note"
 pass "sync shows notes of other sessions"
 
+# --- a note can still be attached after the task was closed -----------------
+./.relay/relay --session "$S4" note --kind result --text "correction: number was wrong" >/dev/null
+python3 - <<EOF
+import json, glob, sys
+events = [json.loads(l) for l in open(glob.glob(".relay/data/$S4.jsonl")[0])]
+notes = [e for e in events if e["type"] == "note"]
+if not any("correction" in (n.get("text") or "") for n in notes):
+    print("FAIL: note after end was not attached to the session's last task", file=sys.stderr)
+    sys.exit(1)
+EOF
+pass "note after end attaches to the last task of the session"
+
 # --- oversized events stay valid JSON ---------------------------------------
 python3 - <<EOF
 import json, subprocess, glob, sys
