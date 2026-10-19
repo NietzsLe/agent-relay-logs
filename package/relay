@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""relay — per-session work log for multiple agents.
+
+See README.md next to this file. Only the Python standard library is used.
+The log is local-only and append-only: one JSONL file per session, plus a
+byte-offset cursor per session.
+"""
+import argparse
+import json
+import os
+import platform
+import random
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+VERSION = "1.0.0"
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(ROOT, "data")
+STALE_H = float(os.environ.get("RELAY_STALE_HOURS", "12"))
+CAP = 25          # maximum lines printed by one sync
+RECENT_DONE = 10  # first sync in a session: number of recently finished items
+NOTE = "[relay] log is only relatively complete — verify git/real state before relying on it"
+
+
+def now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def age_h(ts):
+    t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - t).total_seconds() / 3600
+
+
+def rid():
+    return time.strftime("%y%m%d-%H%M%S", time.gmtime()) + "-" + "%03x" % random.randrange(4096)
+
+
+def git(*a):
+    try:
+        return subprocess.run(["git", *a], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def clip(v, n=300):
+    if isinstance(v, list):
+        return [clip(x, 120) for x in v[:30]]
+    v = (v or "").replace("\n", " ").strip()
+    return v if len(v) <= n else v[: n - 1] + "…"
+
+
+def split(s):
+    return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+
+def path(sid, ext):
+    return os.path.join(DATA, sid + ext)
+
+
+def append(sid, ev):
+    os.makedirs(DATA, exist_ok=True)
+    line = json.dumps(ev, ensure_ascii=False)[:4000] + "\n"
+    fd = os.open(path(sid, ".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
+
+
+def read_file(fn, offset=0):
+    """Return (events, new_offset); only complete newline-terminated lines are read."""
+    evs = []
+    try:
+        with open(os.path.join(DATA, fn), "rb") as f:
+            f.seek(offset)
+            raw = f.read()
+    except OSError:
+        return evs, offset
+    end = raw.rfind(b"\n") + 1
+    for ln in raw[:end].splitlines():
+        try:
+            evs.append(json.loads(ln))
+        except ValueError:
+            pass
+    return evs, offset + end
+
+
+def files():
+    try:
+        return sorted(f for f in os.listdir(DATA) if f.endswith(".jsonl"))
+    except OSError:
+        return []
+
+
+def open_tasks(evs):
+    starts = {e["id"]: e for e in evs if e.get("type") == "start"}
+    for e in evs:
+        if e.get("type") == "end":
+            starts.pop(e.get("task"), None)
+    return list(starts.values())
+
+
+def overlap(a, b):
+    return any(x == y or x.startswith(y.rstrip("/") + "/") or y.startswith(x.rstrip("/") + "/")
+               for x in a for y in b)
+
+
+def who(e):
+    return "%s:%s" % (e.get("agent", "?"), e.get("session", "?")[:8])
+
+
+def fmt(e, tasks):
+    t = e.get("ts", "")[5:16].replace("T", " ")
+    if e["type"] == "start":
+        sc = ",".join(e.get("scope", []))
+        return "▶ %s %s [%s] %s%s" % (t, e["id"], who(e), e.get("title", ""), " {%s}" % sc if sc else "")
+    if e["type"] == "end":
+        st = tasks.get(e.get("task"))
+        s = "■ %s %s [%s] %s: %s" % (t, e.get("task"), who(e), e.get("status"), e.get("summary", ""))
+        if st:
+            s += " — «%s»" % st.get("title", "")
+        if e.get("changes"):
+            s += " | changed: " + ",".join(e["changes"])
+        if e.get("impact"):
+            s += " | impact: " + e["impact"]
+        return s
+    return ""
+
+
+def session_id(args):
+    sid = args.session or os.environ.get("RELAY_SESSION")
+    new = False
+    if not sid:
+        sid = "%s-%s" % (args.agent, rid())
+        new = True
+    return sid, new
+
+
+def ensure_join(sid, args):
+    """Write the session profile line for a new session. Return True if new."""
+    if os.path.exists(path(sid, ".jsonl")):
+        return False
+    dirty = len(git("status", "--porcelain").splitlines())
+    gd, gc = git("rev-parse", "--git-dir"), git("rev-parse", "--git-common-dir")
+    append(sid, {"id": rid(), "ts": now(), "type": "join", "session": sid, "agent": args.agent,
+                 "model": args.model or "", "user": os.environ.get("USER", ""), "host": platform.node(),
+                 "pid": os.getppid(), "cwd": os.getcwd(), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+                 "head": git("rev-parse", "--short", "HEAD"), "worktree": bool(gd and gd != gc), "dirty": dirty})
+    return True
+
+
+def sync(sid, all_=False, first=False):
+    """Print unread events from other sessions and advance the cursor.
+
+    Nothing new means no output. ``first`` limits the first run in a session to
+    open work plus the most recently finished items, instead of full history.
+    """
+    cur_p = path(sid, ".cursor")
+    try:
+        cur = json.load(open(cur_p))
+    except (OSError, ValueError):
+        cur = {}
+    mine, _ = read_file(sid + ".jsonl")
+    my_scope = [s for t in open_tasks(mine) for s in t.get("scope", [])]
+    allev, new = {}, []
+    for fn in files():
+        evs, off = read_file(fn)  # full read so task titles are available
+        allev[fn] = evs
+        if fn == sid + ".jsonl":
+            continue
+        if all_:
+            new += evs
+        elif first:
+            cur[fn] = off
+        else:
+            nev, cur[fn] = read_file(fn, cur.get(fn, 0))
+            new += nev
+    tasks = {e["id"]: e for evs in allev.values() for e in evs if e.get("type") == "start"}
+    if first and not all_:
+        others = [e for fn, evs in allev.items() if fn != sid + ".jsonl" for e in evs]
+        new = open_tasks(others)
+        done = [e for e in others if e.get("type") == "end"][-RECENT_DONE:]
+        new += done
+    new = [e for e in new if e.get("type") in ("start", "end")]
+    new.sort(key=lambda e: e.get("ts", ""))
+    if not all_:
+        os.makedirs(DATA, exist_ok=True)
+        json.dump(cur, open(cur_p, "w"))
+    if not new:
+        return
+    hot = lambda e: overlap(my_scope, e.get("scope", []) or e.get("changes", []))
+    lines = []
+    for e in sorted(new, key=lambda e: not hot(e)):  # stable sort: overlapping scope first
+        line = fmt(e, tasks)
+        if line:
+            lines.append(("! " if hot(e) else "  ") + line)
+    stale = {e["id"] for evs in allev.values() for e in open_tasks(evs) if age_h(e["ts"]) > STALE_H}
+    lines = [l + ("  (possibly abandoned)" if any(i in l for i in stale) and "▶" in l else "") for l in lines]
+    print(NOTE)
+    if not all_ and len(lines) > CAP:
+        extra = len(lines) - CAP
+        lines = lines[:CAP] + ["  … +%d more events (relay sync --all)" % extra]
+    print("\n".join(lines))
+
+
+def base(sid, args, typ):
+    return {"id": rid(), "ts": now(), "type": typ, "session": sid, "agent": args.agent,
+            "cwd": os.getcwd(), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "head": git("rev-parse", "--short", "HEAD")}
+
+
+def doctor():
+    """Print a quick health check. Never raises for missing data."""
+    print("relay %s" % VERSION)
+    print("root: %s" % ROOT)
+    print("data: %s (%s)" % (DATA, "exists" if os.path.isdir(DATA) else "not created yet"))
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        probe = os.path.join(DATA, ".write-test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        print("data writable: yes")
+    except OSError as ex:
+        print("data writable: no (%s)" % ex)
+    print("python: %s" % platform.python_version())
+    print("git: %s" % (git("--version") or "not found (optional)"))
+    fs = files()
+    print("sessions: %d" % len(fs))
+    for fn in fs:
+        evs, _ = read_file(fn)
+        print("  %s: %d events, %d open" % (fn[:-6], len(evs), len(open_tasks(evs))))
+
+
+def main():
+    p = argparse.ArgumentParser(prog="relay")
+    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("--session")
+    p.add_argument("--agent", default=os.environ.get("RELAY_AGENT", "agent"))
+    p.add_argument("--model", default=os.environ.get("RELAY_MODEL", ""))
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start"); s.add_argument("title"); s.add_argument("--scope", default="")
+    e = sub.add_parser("end"); e.add_argument("task", nargs="?")
+    e.add_argument("--status", default="done", choices=["done", "partial", "abandoned", "blocked"])
+    e.add_argument("--summary", default=""); e.add_argument("--changes", default=""); e.add_argument("--impact", default="")
+    y = sub.add_parser("sync"); y.add_argument("--all", action="store_true")
+    sub.add_parser("doctor")
+    sub.add_parser("version")
+    a = p.parse_args()
+
+    if a.cmd == "version":
+        print(VERSION)
+        return
+    if a.cmd == "doctor":
+        doctor()
+        return
+
+    sid, gen = session_id(a)
+    first = ensure_join(sid, a)
+    if gen:
+        print("session=%s  (reuse: --session %s or RELAY_SESSION)" % (sid, sid))
+    if a.cmd == "sync":
+        sync(sid, a.all, first)
+    elif a.cmd == "start":
+        sync(sid, first=first)
+        scope = split(a.scope)
+        ev = base(sid, a, "start"); ev.update(title=clip(a.title), scope=clip(scope))
+        clash = [t for fn in files() if fn != sid + ".jsonl" for t in open_tasks(read_file(fn)[0])
+                 if overlap(scope, t.get("scope", []))]
+        append(sid, ev)
+        print("task=%s" % ev["id"])
+        for t in clash:
+            print("! scope overlaps open work [%s] %s: %s" % (who(t), t["id"], t.get("title", "")))
+    elif a.cmd == "end":
+        mine, _ = read_file(sid + ".jsonl")
+        opn = open_tasks(mine)
+        t = a.task or (opn[-1]["id"] if opn else None)
+        if not t:
+            print("[relay] no open task to finish", file=sys.stderr); return
+        ev = base(sid, a, "end")
+        ev.update(task=t, status=a.status, summary=clip(a.summary), changes=clip(split(a.changes)), impact=clip(a.impact))
+        append(sid, ev)
+        print("ended=%s" % t)
+        sync(sid)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as ex:  # logging must never block the main work
+        print("[relay] error: %s" % ex, file=sys.stderr)
