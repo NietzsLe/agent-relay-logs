@@ -30,7 +30,7 @@ Only four paths are touched:
 
 | Path | Change |
 |---|---|
-| `.relay/` | Runtime: `relay` CLI (schema v2), `README.md`, `SNIPPET.md`; later `data/` and `install.json` |
+| `.relay/` | Runtime: `relay` CLI (schema v3), `README.md`, `SNIPPET.md`; later `data/`, `cursors/`, `install.json` |
 | `.gitignore` | Adds `.relay/` (if missing) |
 | `AGENTS.md` | Inserts/replaces one `<!-- BEGIN relay-logs -->` … `<!-- END relay-logs -->` block |
 | `CLAUDE.md` | Inserts/replaces the same kind of block |
@@ -114,8 +114,17 @@ agent-relay-logs/
 
 ## How the runtime works
 
-- One JSONL file per session: `.relay/data/<session>.jsonl`. Append-only, one
-  writer per file, so sessions do not collide.
+- **One file per day, shared by every session**: `.relay/data/YYYY-MM-DD.jsonl`.
+  Appends use `O_APPEND` with a single `write()`, so concurrent sessions never
+  interleave a line. The log reads as a diary of the day: what happened, in
+  order, who did it.
+- **Cursors are per session**, in `.relay/cursors/<session>.json` (day file →
+  byte offset already read). `sync` shows only what is new to that session and
+  never repeats itself; a session never sees its own events as somebody else's
+  news.
+- Installations from v1/v2 (one file per session) are migrated automatically:
+  events are folded into the day file of their timestamp, the original file is
+  moved to `data/legacy/`. Nothing is deleted.
 - Four event types, each carrying the detail a reader needs:
 
   | Event | Answers | Fields |
@@ -127,9 +136,9 @@ agent-relay-logs/
 
   The `note` type is what makes a long task legible: an agent working for an
   hour records a problem at minute 10 instead of only reporting at the end.
-- Each session has a cursor: `.relay/data/<session>.cursor` stores the byte
-  offset read in every other session's file. `sync` prints only unread events and
-  advances the cursor; nothing new means no output.
+- Each session has a cursor: `.relay/cursors/<session>.json` stores the byte
+  offset read in every day file. `sync` prints only unread events and advances
+  the cursor; nothing new means no output.
 - First `sync` in a session shows open work, the notes attached to it, and the
   last ~10 finished tasks with their plans — not the whole history. `sync --all`
   shows everything without advancing the cursor.

@@ -11,7 +11,9 @@ absent).
 - Before the final response: `.relay/relay --session <id> sync`.
 - Finish: `.relay/relay --session <id> end --status done|partial|abandoned|blocked --summary "..." --done "..." --problem "<problem> => <fix>" --verify "..." --impact "..."`.
 - Detail matters: goal/plan/accept on start, notes while working, done/problems/
-  verify/metrics/next on end. Local-only, no secrets/PII, not a source of truth.
+  verify/metrics/next on end. The log is one file per day
+  (`.relay/data/YYYY-MM-DD.jsonl`), cursors in `.relay/cursors/`. Local-only,
+  no secrets/PII, not a source of truth.
 
 _This block belongs to **agent-relay-logs** and is managed by its installer. To
 uninstall, run `scripts/uninstall.sh` from the agent-relay-logs repository, or

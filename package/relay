@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""relay — per-session work log for multiple agents (schema v2).
+"""relay — per-session work log for multiple agents (schema v3).
 
-One JSON object per line in data/<session>.jsonl (append-only, one writer per
-file). Event types:
+Layout (v3):
+  data/YYYY-MM-DD.jsonl   every event of that UTC day, all sessions, one file
+  cursors/<session>.json  per-session read cursor: {data file -> byte offset}
+  data/legacy/            per-session files from v1/v2, kept after migration
+
+One JSON object per line. Event types:
 
   join  — session profile (agent, model, host, cwd, branch, head…)
   start — a task opens: what will be done, how, and how "done" is judged
@@ -18,15 +22,20 @@ import json
 import os
 import platform
 import random
+import re
+import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "2.0.0"
-SCHEMA = 2
+VERSION = "3.0.0"
+SCHEMA = 3
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
+CURSORS = os.path.join(ROOT, "cursors")
+LEGACY = os.path.join(DATA, "legacy")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 STALE_H = float(os.environ.get("RELAY_STALE_HOURS", "12"))
 CAP = 25          # maximum lines printed by one sync
 RECENT_DONE = 10  # first sync in a session: number of recently finished items
@@ -132,13 +141,46 @@ def one(text, limit=160):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def path(sid, ext):
-    return os.path.join(DATA, sid + ext)
-
-
 # --------------------------------------------------------------------------- storage
-def append(sid, ev):
-    """Append one event. The line is always valid JSON, even when huge."""
+def day_stamp(ts=None):
+    """UTC day of an event timestamp (or today)."""
+    if ts:
+        return ts[:10]
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def day_path(day=None):
+    return os.path.join(DATA, "%s.jsonl" % (day or day_stamp()))
+
+
+def is_day_file(name):
+    return bool(DAY_RE.match(name))
+
+
+def cursor_path(sid):
+    return os.path.join(CURSORS, sid + ".json")
+
+
+def data_files():
+    """Day files first, then legacy per-session files that still need migrating."""
+    try:
+        names = sorted(os.listdir(DATA))
+    except OSError:
+        return []
+    days = [n for n in names if is_day_file(n)]
+    legacy = [n for n in names if n.endswith(".jsonl") and not is_day_file(n)]
+    return days + legacy
+
+
+def legacy_files():
+    try:
+        return sorted(n for n in os.listdir(DATA) if n.endswith(".jsonl") and not is_day_file(n))
+    except OSError:
+        return []
+
+
+def write_event(ev, day=None):
+    """Append one event to a day file. The line is always valid JSON."""
     os.makedirs(DATA, exist_ok=True)
     line = json.dumps(ev, ensure_ascii=False)
     if len(line) + 1 > MAX_LINE:
@@ -152,11 +194,17 @@ def append(sid, ev):
             keep["summary"] = clip_text(ev.get("summary", ""), 200)
             keep["text"] = clip_text(ev.get("text", ""), 200)
             line = json.dumps(keep, ensure_ascii=False)
-    fd = os.open(path(sid, ".jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    # one write() call with O_APPEND: concurrent sessions never interleave a line
+    fd = os.open(day_path(day), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     try:
         os.write(fd, (line + "\n").encode())
     finally:
         os.close(fd)
+
+
+def append(sid, ev):
+    """Append one event to today's file."""
+    write_event(ev)
 
 
 def shrink(ev):
@@ -190,19 +238,45 @@ def read_file(fn, offset=0):
     return evs, offset + end
 
 
-def files():
-    try:
-        return sorted(f for f in os.listdir(DATA) if f.endswith(".jsonl"))
-    except OSError:
-        return []
-
-
 def all_events():
     out = []
-    for fn in files():
+    for fn in data_files():
         evs, _ = read_file(fn)
         out.extend(evs)
     return out
+
+
+def session_events(sid):
+    """Every event written by this session, across all day files."""
+    return [e for e in all_events() if e.get("session") == sid]
+
+
+def migrate(dry_run=False):
+    """Move v1/v2 per-session files into the day files.
+
+    The original files are kept in data/legacy/ — nothing is deleted.
+    """
+    report = []
+    for name in legacy_files():
+        events, _ = read_file(name)
+        by_day = {}
+        for e in events:
+            by_day.setdefault(day_stamp(e.get("ts")), []).append(e)
+        for day, evs in by_day.items():
+            existing, _ = read_file("%s.jsonl" % day)
+            known = {e.get("id") for e in existing}
+            fresh = [e for e in evs if e.get("id") not in known]
+            for e in fresh:
+                if not dry_run:
+                    write_event(e, day)
+            report.append("%s -> %s.jsonl: %d sự kiện (%d mới)"
+                          % (name, day, len(evs), len(fresh)))
+        if not dry_run:
+            os.makedirs(LEGACY, exist_ok=True)
+            dest = os.path.join(LEGACY, name)
+            if not os.path.exists(dest):
+                shutil.move(os.path.join(DATA, name), dest)
+    return report
 
 
 def open_tasks(evs):
@@ -231,8 +305,7 @@ def explicit_agent(args):
 
 def session_agent(sid):
     """Agent name recorded when this session joined — so later commands need not repeat it."""
-    evs, _ = read_file(sid + ".jsonl")
-    for e in evs:
+    for e in session_events(sid):
         if e.get("type") == "join":
             return e.get("agent") or None
     return None
@@ -253,7 +326,7 @@ def session_id(args):
 
 def ensure_join(sid, args):
     """Write the session profile line for a new session. Return True if new."""
-    if os.path.exists(path(sid, ".jsonl")):
+    if any(e.get("type") == "join" for e in session_events(sid)):
         return False
     dirty = len(git("status", "--porcelain").splitlines())
     gd, gc = git("rev-parse", "--git-dir"), git("rev-parse", "--git-common-dir")
@@ -367,24 +440,40 @@ def fmt_duration(seconds):
 
 
 # --------------------------------------------------------------------------- sync
-def sync(sid, all_=False, first=False, full=False, only=None):
-    """Print unread events from other sessions and advance the cursor."""
-    cur_p = path(sid, ".cursor")
+def load_cursor(sid):
     try:
-        cur = json.load(open(cur_p))
+        with open(cursor_path(sid), "r", encoding="utf-8") as f:
+            cur = json.load(f)
+        return cur if isinstance(cur, dict) else {}
     except (OSError, ValueError):
-        cur = {}
-    mine, _ = read_file(sid + ".jsonl")
+        return {}
+
+
+def save_cursor(sid, cur):
+    os.makedirs(CURSORS, exist_ok=True)
+    path = cursor_path(sid)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cur, f)
+    os.replace(tmp, path)
+
+
+def sync(sid, all_=False, first=False, full=False, only=None):
+    """Print unread events from other sessions and advance the cursor.
+
+    The log is one file per day, shared by every session; each session keeps its
+    own cursor (file name -> byte offset already read).
+    """
+    cur = load_cursor(sid)
+    mine = session_events(sid)
     my_scope = [s for t in open_tasks(mine) for s in t.get("scope", [])]
     my_tags = set()
     for t in open_tasks(mine):
         my_tags.update(t.get("tags", []))
     allev, new = {}, []
-    for fn in files():
+    for fn in data_files():
         evs, off = read_file(fn)  # full read so task titles are available
         allev[fn] = evs
-        if fn == sid + ".jsonl":
-            continue
         if all_:
             new += evs
         elif first:
@@ -394,7 +483,7 @@ def sync(sid, all_=False, first=False, full=False, only=None):
             new += nev
     tasks = {e["id"]: e for evs in allev.values() for e in evs if e.get("type") == "start"}
     if first and not all_:
-        others = [e for fn, evs in allev.items() if fn != sid + ".jsonl" for e in evs]
+        others = [e for evs in allev.values() for e in evs if e.get("session") != sid]
         open_ids = {t["id"] for t in open_tasks(others)}
         done_events = [e for e in others if e.get("type") == "end"][-RECENT_DONE:]
         done_ids = {e.get("task") for e in done_events}
@@ -404,13 +493,13 @@ def sync(sid, all_=False, first=False, full=False, only=None):
         new += [e for e in others if e.get("type") == "start" and e["id"] in done_ids]
         new += [e for e in others if e.get("type") == "note" and e.get("task") in done_ids]
         new += done_events
-    new = [e for e in new if e.get("type") in ("start", "note", "end")]
+    # a session never sees its own events as "somebody else's news"
+    new = [e for e in new if e.get("type") in ("start", "note", "end") and e.get("session") != sid]
     if only:
         new = [e for e in new if e.get("task") == only or e.get("id") == only]
     new.sort(key=lambda e: e.get("ts", ""))
     if not all_:
-        os.makedirs(DATA, exist_ok=True)
-        json.dump(cur, open(cur_p, "w"))
+        save_cursor(sid, cur)
     if not new:
         return
     hot = lambda e: (overlap(my_scope, e.get("scope", []) or e.get("changes", []))
@@ -491,6 +580,7 @@ def doctor():
     print("relay %s (schema %d)" % (VERSION, SCHEMA))
     print("root: %s" % ROOT)
     print("data: %s (%s)" % (DATA, "exists" if os.path.isdir(DATA) else "not created yet"))
+    print("cursors: %s (%s)" % (CURSORS, "exists" if os.path.isdir(CURSORS) else "not created yet"))
     try:
         os.makedirs(DATA, exist_ok=True)
         probe = os.path.join(DATA, ".write-test")
@@ -502,15 +592,24 @@ def doctor():
         print("data writable: no (%s)" % ex)
     print("python: %s" % platform.python_version())
     print("git: %s" % (git("--version") or "not found (optional)"))
-    fs = files()
-    print("sessions: %d" % len(fs))
-    for fn in fs:
+    for fn in data_files():
         evs, _ = read_file(fn)
         kinds = {}
         for e in evs:
             kinds[e.get("type", "?")] = kinds.get(e.get("type", "?"), 0) + 1
-        print("  %s: %d events (%s), %d open" % (fn[:-6], len(evs),
-              ", ".join("%s:%d" % kv for kv in sorted(kinds.items())), len(open_tasks(evs))))
+        sessions = {e.get("session") for e in evs if e.get("session")}
+        print("  %s: %d events (%s), %d phiên, %d việc đang dở"
+              % (fn, len(evs), ", ".join("%s:%d" % kv for kv in sorted(kinds.items())),
+                 len(sessions), len(open_tasks(evs))))
+    try:
+        cursors = [f for f in os.listdir(CURSORS) if f.endswith(".json")]
+    except OSError:
+        cursors = []
+    print("cursors: %d" % len(cursors))
+    legacy = legacy_files()
+    if legacy:
+        print("legacy per-session files: %s (run 'relay migrate' to fold them into the day files)"
+              % ", ".join(legacy))
 
 
 # --------------------------------------------------------------------------- CLI
@@ -568,6 +667,9 @@ def build_parser():
     sh.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
     sh.add_argument("--json", action="store_true", help="raw JSON events")
 
+    mg = sub.add_parser("migrate", help="fold legacy per-session files into the day files")
+    mg.add_argument("--dry-run", action="store_true", help="show what would move, write nothing")
+
     sub.add_parser("doctor", help="health check")
     sub.add_parser("version", help="print the version")
     return p
@@ -583,19 +685,19 @@ def pick_task(sid, args, allow_last=False, allow_session_last=False):
     """
     if getattr(args, "task", None):
         return args.task
-    mine, _ = read_file(sid + ".jsonl")
+    mine = session_events(sid)
     opn = open_tasks(mine)
     if opn:
         return opn[-1]["id"]
     agent = resolve_agent(sid, args)
     cands = []
-    for fn in files():
+    for fn in data_files():
         evs, _ = read_file(fn)
-        join = next((e for e in evs if e.get("type") == "join"), {})
-        if join.get("agent") != agent:
-            continue
         for t in open_tasks(evs):
-            cands.append(t)
+            join = next((e for e in evs if e.get("type") == "join"
+                         and e.get("session") == t.get("session")), {})
+            if join.get("agent") == agent:
+                cands.append(t)
     if len(cands) == 1:
         return cands[0]["id"]
     if len(cands) > 1:
@@ -622,13 +724,24 @@ def main():
     if args.cmd == "doctor":
         doctor()
         return
+    if args.cmd == "migrate":
+        report = migrate(args.dry_run)
+        for line in report:
+            print(line)
+        print("dry run: nothing written" if args.dry_run else "migrated %d file(s)" % len(report))
+        return
+
+    # fold v1/v2 per-session files into the day files (kept in data/legacy/)
+    if legacy_files():
+        report = migrate()
+        for line in report:
+            print("[relay] migrated %s" % line, file=sys.stderr)
 
     sid, gen = session_id(args)
     read_only = args.cmd == "show"
-    first = False
     if read_only:
-        # read-only commands must not create a stray session file
-        first = ensure_join(sid, args) if os.path.exists(path(sid, ".jsonl")) else False
+        # read-only commands must not create a stray session
+        first = False
     else:
         first = ensure_join(sid, args)
     if gen:
@@ -658,7 +771,7 @@ def main():
             "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
             "status": "planned",
         })
-        clash = [t for fn in files() if fn != sid + ".jsonl" for t in open_tasks(read_file(fn)[0])
+        clash = [t for t in open_tasks([e for e in all_events() if e.get("session") != sid])
                  if overlap(scope, t.get("scope", []))]
         append(sid, ev)
         print("task=%s" % ev["id"])

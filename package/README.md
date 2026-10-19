@@ -1,9 +1,40 @@
-# `.relay` — per-session work log for multiple agents (schema v2)
+# `.relay` — per-session work log for multiple agents (schema v3)
 
 A small, self-contained system that can be copied into another project. Goal:
 agent sessions (Claude, OpenCode, Codex, …) working in the same repository can
 see **what each session planned, what it hit, and what it left behind** — so
 they understand the environment without asking the user again.
+
+## Layout
+
+```text
+.relay/
+├── relay              the CLI
+├── README.md          this file
+├── SNIPPET.md         short usage snippet
+├── install.json       install manifest (local)
+├── data/
+│   ├── 2026-10-19.jsonl   every event of that UTC day — all sessions, one file
+│   ├── 2026-10-20.jsonl
+│   └── legacy/            per-session files from v1/v2, kept after migration
+└── cursors/
+    └── <session>.json     per-session read cursor: {data file → byte offset}
+```
+
+**One file per day.** Every session writes into the same `data/YYYY-MM-DD.jsonl`,
+so the log can be read as a diary of the day ("what happened today, in order,
+who did it"). Appends use `O_APPEND` with a single `write()`, so concurrent
+sessions never interleave a line.
+
+**Cursors are per session**, in their own directory: each session remembers how
+far it has read in each day file, so `sync` shows only what is new *to that
+session* and never repeats itself. A session never sees its own events as
+somebody else's news.
+
+**Migration.** Installations from v1/v2 (one file per session) are migrated
+automatically on the next command: the events are folded into the day file of
+their timestamp and the original file is moved to `data/legacy/` — nothing is
+deleted. `relay migrate --dry-run` shows what would move.
 
 ## Scope: local only
 
@@ -28,19 +59,19 @@ hour can record a problem at minute 10 instead of only reporting at the end.
 
 ## Model
 
-- Each session writes to its own append-only file `data/<session>.jsonl`
-  (one writer per file, so sessions never collide).
+- Events are appended to `data/YYYY-MM-DD.jsonl` (one file per UTC day, shared
+  by all sessions). Each line is one JSON object.
 - Every event carries `id, ts, type, v (schema version), session, agent, cwd,
   branch, head`.
 - **`start` without `end` means work is still in progress.** Work older than 12
   hours (`RELAY_STALE_HOURS`) is labelled "possibly abandoned".
-- **Read cursor** for each session: `data/<session>.cursor` (byte offset already
-  read in each other session's file). `sync` prints only unread events and
+- **Read cursor** for each session: `cursors/<session>.json` maps each day file
+  to the byte offset already read. `sync` prints only unread events and
   advances the cursor; nothing new means no output (saves tokens). Events whose
   `scope` or `tags` overlap the current session's open work are marked `!` and
   sorted first.
-- First run in a session: open work, the notes attached to it, the last ~10
-  finished tasks and their plans. Not the whole history — `sync --all` shows
+- First run in a session: open work, the notes attached to it, and the last ~10
+  finished tasks with their plans — not the whole history. `sync --all` shows
   everything without advancing the cursor.
 - The **agent name is inherited** from the session's `join` event, so
   `relay --session <id> end ...` no longer records the agent as "agent".
@@ -48,7 +79,7 @@ hour can record a problem at minute 10 instead of only reporting at the end.
   and `--changes "repo (new, commit abc)"` both survive.
 - Every event line is valid JSON, even when oversized: oversized events are
   trimmed and flagged with `"trimmed": true` instead of being cut mid-object.
-- Old (schema v1) events are still readable and still render.
+- Old (schema v1/v2) events are still readable and still render.
 
 ## Commands
 
@@ -68,6 +99,7 @@ relay [--session ID] end [TASK] --status done|partial|abandoned|blocked
 
 relay [--session ID] sync [--all] [--full] [--task ID]
 relay [--session ID] show [TASK] [--json]
+relay migrate [--dry-run]
 relay doctor
 relay version
 ```

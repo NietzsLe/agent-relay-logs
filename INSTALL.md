@@ -16,9 +16,11 @@ replaces one marker block:
 
 | Path | Change |
 |---|---|
-| `.relay/relay` | CLI copied from `package/relay` (schema v2) |
+| `.relay/relay` | CLI copied from `package/relay` (schema v3) |
 | `.relay/README.md`, `.relay/SNIPPET.md` | Runtime docs |
 | `.relay/install.json` | Install manifest (local, git-ignored) |
+| `.relay/data/YYYY-MM-DD.jsonl` | The log: one file per day, all sessions |
+| `.relay/cursors/<session>.json` | Per-session read cursor |
 | `.gitignore` | Adds `.relay/` if neither `.relay` nor `.relay/` is present |
 | `AGENTS.md` | Marker block added or updated |
 | `CLAUDE.md` | Marker block added or updated |
@@ -77,13 +79,20 @@ adding a second one.
 **Upgrading an existing installation:** if the target already has `.relay/`, the
 runtime files are kept unless `--force` is given. The install output says which
 version is installed and which one the package provides, e.g.
-`relay: kept existing (v1.0.0; use --force to update to v2.0.0)`. Upgrade with:
+`relay: kept existing (v1.0.0; use --force to update to v3.0.0)`. Upgrade with:
 
 ```bash
 ./scripts/install.sh --target /path/to/project --force --backup
 ```
 
-`.relay/data` (the existing log) is never touched by an upgrade.
+`.relay/data` (the existing log) is never touched by an upgrade. The new
+runtime migrates an old per-session layout on the first command: the events are
+folded into `data/YYYY-MM-DD.jsonl` and the original file is moved to
+`data/legacy/` (nothing is deleted). To see it first:
+
+```bash
+/path/to/project/.relay/relay migrate --dry-run
+```
 
 ## Step 3 — verify
 
@@ -116,10 +125,12 @@ grep -nF '.relay/' "$TARGET/.gitignore"
 
 Expected:
 
-- `relay doctor` reports `relay 2.0.0 (schema 2)` and `result: OK`.
+- `relay doctor` reports `relay 3.0.0 (schema 3)` and lists the day file.
 - `start` prints `task=…`; `note` prints `note=… task=…`; `end` prints
   `ended=… status=done duration=… notes=1`.
 - `show` prints the goal, the plan, the note and the verification.
+- Exactly **one** file in `.relay/data/` (named `YYYY-MM-DD.jsonl`) and one
+  cursor in `.relay/cursors/`.
 - Each `grep -c` prints `1`.
 - `.gitignore` contains `.relay/`.
 

@@ -26,9 +26,14 @@ exactly what changed.
   `start` = goal/plan/accept/scope/tags · `note` = kind/text/detail ·
   `end` = summary/done/problems/verify/metrics/changes/commits/next/lessons/impact.
   A log of "task X started" is worth nothing to the next session.
+- **One file per day**: `data/YYYY-MM-DD.jsonl` holds every session's events of
+  that UTC day; cursors live in `cursors/<session>.json`. Appends must be
+  atomic (`O_APPEND` + a single `write()`), so concurrent sessions never
+  interleave a line.
 - One line must always be valid JSON. Oversized events are trimmed and flagged
   (`"trimmed": true`) — never cut mid-object.
-- Schema v1 events must stay readable; new fields are optional and additive.
+- Schema v1/v2 events must stay readable; new fields are optional and additive.
+  Old per-session files are migrated into the day file, never deleted.
 - The agent name is inherited from the session's `join` event, so later commands
   do not have to repeat `--agent`.
 - List options are split on commas that are not inside brackets or quotes

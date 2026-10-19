@@ -11,6 +11,9 @@ know the context. Tool: `.relay/relay` (python3). Set your agent name with
 **reuse it** with `--session <id>` in every later command (each shell command is
 a new process, so environment variables do not persist).
 
+The log is one file per day: `.relay/data/YYYY-MM-DD.jsonl` (every session of
+that day), cursors per session in `.relay/cursors/`.
+
 - **Start of every real task** (after each user prompt that asks for work):
   ```bash
   .relay/relay --agent <name> start "<one-line title>" \

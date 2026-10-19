@@ -21,7 +21,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = REPO_ROOT / "package"
 TEMPLATES = REPO_ROOT / "templates"

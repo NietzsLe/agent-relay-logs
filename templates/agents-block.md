@@ -44,6 +44,8 @@ Rules:
   lock; `pytest tests/test_migrate.py` green" is useful.
 - Only log real work; never log secrets, tokens, or PII.
 - A `start` without an `end` means work is still in progress.
+- The log is one file per day — `.relay/data/YYYY-MM-DD.jsonl` (all sessions of
+  that day); read cursors live in `.relay/cursors/`.
 - The log is only *relatively* complete. "Not in the log" does not mean "did not
   happen" — verify with `git log/status`, files, and the real project state.
 - Read `.relay/README.md` for the full model; `relay show <task>` prints one
