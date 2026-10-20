@@ -1356,6 +1356,12 @@ def pick_task(sid, args, allow_last=False, allow_session_last=False):
     opn = open_tasks(mine)
     if opn:
         return opn[-1]["id"]
+    if allow_session_last:
+        # my own session's last task wins over other sessions' open tasks:
+        # a correction belongs to the task I actually worked on
+        started = [e for e in mine if e.get("type") == "start"]
+        if started:
+            return started[-1]["id"]
     agent = resolve_agent(sid, args)
     cands = []
     for fn in data_files():
@@ -1371,10 +1377,6 @@ def pick_task(sid, args, allow_last=False, allow_session_last=False):
         print("[relay] nhiều việc đang dở của agent '%s', chọn rõ task id: %s"
               % (agent, ", ".join(t["id"] for t in cands)), file=sys.stderr)
         return None
-    if allow_session_last:
-        started = [e for e in mine if e.get("type") == "start"]
-        if started:
-            return started[-1]["id"]
     if allow_last:
         ids = [e.get("id") for e in all_events() if e.get("type") == "start"]
         if ids:

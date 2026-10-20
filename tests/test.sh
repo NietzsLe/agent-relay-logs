@@ -238,6 +238,11 @@ pass "sync shows notes of other sessions"
 # --- a note can still be attached after the task was closed -----------------
 ./.relay/relay --session "$S4" note --kind result --text "correction: number was wrong" >/dev/null
 events_of "$S4" | grep -q "correction" || fail "note after end was not attached to the session's last task"
+# my own session's last task wins over other sessions' open tasks of the same agent
+./.relay/relay --agent tester2 --session "noisy-$$" start "unrelated open task" >/dev/null
+./.relay/relay --session "$S4" note --kind result --text "second correction" >/dev/null \
+    || fail "note on a closed session failed when the agent has other open tasks"
+events_of "$S4" | grep -q "second correction" || fail "note landed on the wrong task"
 pass "note after end attaches to the last task of the session"
 
 # --- oversized events stay valid JSON ---------------------------------------
