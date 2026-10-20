@@ -82,7 +82,7 @@ pass "install is idempotent"
 cd "$P"
 SID="test-$$"
 ./.relay/relay --agent tester --session "$SID" start "first task" --scope src/a >/dev/null
-./.relay/relay --agent tester --session "$SID" end --status done --summary "finished" --changes src/a >/dev/null
+./.relay/relay --agent tester --session "$SID" end --status done --summary "finished" --verify "ok" --changes src/a >/dev/null
 ./.relay/relay --agent tester --session "$SID" start "second task" --scope src/b >/dev/null
 
 SID2="test2-$$"
@@ -90,20 +90,24 @@ OUT=$(./.relay/relay --agent other --session "$SID2" sync)
 echo "$OUT" | grep -q "second task" || fail "sync did not show the open task"
 OUT2=$(./.relay/relay --agent other --session "$SID2" sync)
 [ -z "$OUT2" ] || fail "second sync should be empty, got: $OUT2"
-./.relay/relay --agent tester --session "$SID" end --status done --summary "finished again" >/dev/null
+./.relay/relay --agent tester --session "$SID" end --status done --summary "finished again" --verify "ok" >/dev/null
 ./.relay/relay doctor >/dev/null
 pass "relay start/end/sync/doctor"
 
-# --- v3.1: quality nudges and `open` ---------------------------------------
+# --- v3.1: quality nudges, open, and end gate ---------------------------
 SID3="test3-$$"
 ERR=$(./.relay/relay --agent tester --session "$SID3" start "thin task" 2>&1 >/dev/null)
 echo "$ERR" | grep -q -- "--plan" || fail "thin start gave no nudge"
 ./.relay/relay open | grep -q "thin task" || fail "open did not list the open task"
-ERR=$(./.relay/relay --agent tester --session "$SID3" end --status done 2>&1 >/dev/null)
-echo "$ERR" | grep -q -- "--verify" || fail "thin end gave no nudge"
+if ./.relay/relay --agent tester --session "$SID3" end --status done >/dev/null 2>"$TMP/gate.err"; then
+    fail "end without --verify should fail the gate"
+fi
+grep -q "GATE" "$TMP/gate.err" || fail "gate gave no GATE message"
+./.relay/relay --session "$SID3" end --status done --summary "s" --verify "ok" --force >/dev/null
+events_of "$SID3" | grep -q '"forced": true' || fail "--force did not record forced=true"
 ./.relay/relay open | grep -q "thin task" && fail "open still lists a closed task"
 ./.relay/relay open --stale | grep -q "no stale" || fail "open --stale should be empty"
-pass "quality nudges and open"
+pass "quality nudges, open, and end gate"
 
 # --- schema v3: detail in every event type ---------------------------------
 P4="$TMP/project4"
@@ -113,7 +117,7 @@ cd "$P4"
 S4="v3-$$"
 ./.relay/relay --agent tester2 --session "$S4" start "task v3" \
     --goal "why this task exists" --plan "step one" --plan "step two" \
-    --scope "src/a,src/b" --tags "perf,db" --accept "tests green" --refs "T-65,L-42" >/dev/null
+    --scope "src/a.py,src/b.py" --tags "perf,db" --accept "tests green" --refs "T-65,L-42" >/dev/null
 TASK=$(events_of "$S4" | python3 -c 'import json,sys
 for line in sys.stdin:
     e = json.loads(line)
@@ -145,7 +149,7 @@ end = by["end"][0]
 note = by["note"][0]
 check(start.get("goal") == "why this task exists", "goal not stored")
 check(start.get("plan") == ["step one", "step two"], "plan not stored: %r" % start.get("plan"))
-check(start.get("scope") == ["src/a", "src/b"], "scope not split: %r" % start.get("scope"))
+check(start.get("scope") == ["src/a.py", "src/b.py"], "scope not split: %r" % start.get("scope"))
 check(start.get("tags") == ["perf", "db"], "tags not stored")
 check(start.get("accept") == ["tests green"], "accept not stored")
 check(start.get("refs") == ["T-65", "L-42"], "refs not stored")
@@ -199,8 +203,8 @@ pass "legacy per-session files migrate into the day file"
 
 # --- smart comma splitting --------------------------------------------------
 cd "$P4"
-./.relay/relay --agent tester3 --session "split-$$" start "split test" >/dev/null
-./.relay/relay --session "split-$$" end --status done --summary "s" \
+./.relay/relay --agent tester3 --session "split-$$" start "split test" --scope "x.py,y.py,repo (new, commit abc)" >/dev/null
+./.relay/relay --session "split-$$" end --status done --summary "s" --verify "ok" \
     --changes "repo (new, commit abc)" --changes "x.py,y.py" >/dev/null
 events_of "split-$$" | python3 -c '
 import json, sys
@@ -249,6 +253,103 @@ for path in glob.glob(".relay/data/*.jsonl"):
 assert found, "the oversized start event was not written"
 EOF
 pass "oversized events stay valid JSON and are flagged"
+
+# --- v4: rhythm, scope, long commands, score ----------------------------------
+P6="$TMP/project6"
+mkdir -p "$P6"
+"$ROOT/scripts/install.sh" --target "$P6" >/dev/null
+cd "$P6"
+git init -q .
+git add .
+git -c user.name=test -c user.email=test@example.com commit -qm "initial"
+V4="v4-$$"
+TASKV4=$(./.relay/relay --agent tester4 --session "$V4" start "rhythm task" \
+    --goal "g" --plan "p1" --scope "tracked.txt" --accept "a" \
+    | grep "^task=" | cut -d= -f2)
+[ -n "$TASKV4" ] || fail "v4 start printed no task id"
+echo tracked > tracked.txt
+./.relay/relay --session "$V4" note --kind progress --text "did step one" \
+    --next "step two" --where "tracked.txt:10" >/dev/null
+events_of "$V4" | grep -q '"next": "step two"' || fail "note --next not stored"
+events_of "$V4" | grep -q '"where": \["tracked.txt:10"\]' || fail "note --where not stored"
+
+# scope drift: an unlogged file change must trip tick (exit 2)
+echo change > outside.txt
+set +e
+./.relay/relay --session "$V4" tick >"$TMP/tick1.out" 2>&1
+TICK1=$?
+set -e
+[ "$TICK1" = 2 ] || fail "tick should flag files outside the scope (exit=$TICK1)"
+grep -q "ngoài scope" "$TMP/tick1.out" || fail "tick gave no scope message"
+./.relay/relay --session "$V4" scope --add "outside.txt" --why "needed too" >/dev/null
+set +e
+./.relay/relay --session "$V4" tick >"$TMP/tick2.out" 2>&1
+TICK2=$?
+set -e
+[ "$TICK2" = 0 ] || fail "tick after scope --add should pass (exit=$TICK2)"
+grep -q "ngoài scope" "$TMP/tick2.out" && fail "drift persists after scope --add"
+
+# run --record: late and over are computed with tolerance both ways
+./.relay/relay --session "$V4" run --record --cmd "sleep 60" --eta 1m --actual 70s --exit 0 >/dev/null
+./.relay/relay --session "$V4" run --eta 5m -- sleep 1 >/dev/null
+./.relay/relay board | grep -q "rhythm task" || fail "board did not list the open task"
+./.relay/relay board | grep -q "step two" || fail "board did not show the next step"
+sleep 2
+set +e
+RELAY_GAP_MAX=1 RELAY_NUDGE=0 ./.relay/relay --session "$V4" tick >"$TMP/tick3.out" 2>&1
+TICK3=$?
+set -e
+[ "$TICK3" = 2 ] || fail "tick should flag silence past a 1s limit (exit=$TICK3)"
+grep -q "chưa ghi" "$TMP/tick3.out" || fail "tick gave no silence message"
+
+# guard --stop: once, and never against an explicit ack
+echo '{"stop_hook_active": true}' | ./.relay/relay --session "$V4" guard --stop >/dev/null \
+    || fail "guard with stop_hook_active should pass"
+set +e
+RELAY_GAP_MAX=1 ./.relay/relay --session "$V4" guard --stop >"$TMP/guard.out" 2>&1
+GUARD=$?
+set -e
+[ "$GUARD" = 2 ] || fail "guard should block when silent too long (exit=$GUARD)"
+
+# --key maps a harness session to a relay session
+./.relay/relay --agent tester4 --key "key-$$" start "keyed task" --scope tracked.txt >/dev/null
+[ -f ".relay/keys/key-$$.json" ] || fail "key mapping not saved"
+./.relay/relay --key "key-$$" note --kind progress --text "via key" >/dev/null \
+    || fail "note --key failed"
+KSES=$(python3 -c "import json; print(json.load(open('.relay/keys/key-$$.json'))['session'])")
+events_of "$KSES" | grep -q "via key" || fail "note via --key landed in the wrong session"
+./.relay/relay --key "key-$$" run --record --cmd "sleep 60" --eta 1m --actual 200s --exit 0 >/dev/null
+events_of "$KSES" | grep -q '"late_s": 80' || fail "late_s not computed (200s vs eta 1m)"
+./.relay/relay --key "key-$$" run --record --cmd "quick" --eta 10m --actual 60s --exit 0 >/dev/null
+events_of "$KSES" | grep -q '"over_s": 90' || fail "over_s not computed (60s vs eta 10m)"
+./.relay/relay --key "key-$$" run --record --cmd "undeclared" --actual 200s --exit 0 >/dev/null
+events_of "$KSES" | grep -q '"late_s": 80' || fail "undeclared 200s run should count late_s=80"
+
+# end records the score; show prints it
+./.relay/relay --session "$V4" end --status done --summary "done it" --done "d1" \
+    --verify "pytest ok" --changes "tracked.txt,outside.txt" >/dev/null
+OUT=$(./.relay/relay --session "show-$$" show "$TASKV4")
+echo "$OUT" | grep -q "score: " || fail "show did not print the score"
+echo "$OUT" | grep -q "step two" || fail "show did not print the note next step"
+echo "$OUT" | grep -q "tracked.txt:10" || fail "show did not print the note where"
+./.relay/relay stats | grep -q "score TB" || fail "stats printed no scoreboard"
+pass "rhythm, scope, long commands, score, keys, guard"
+
+# --- hooks install/uninstall -------------------------------------------------
+P7="$TMP/project7"
+mkdir -p "$P7"
+"$ROOT/scripts/install.sh" --target "$P7" --hooks >/dev/null
+[ -f "$P7/.opencode/plugins/opencode-nudge.js" ] || fail "opencode plugin not installed"
+python3 -c "import json; d=json.load(open('$P7/.claude/settings.local.json')); assert 'relay tick --hook' in json.dumps(d), 'tick hook missing'; assert 'relay guard --stop' in json.dumps(d), 'guard hook missing'" \
+    || fail "claude hooks not merged"
+"$ROOT/scripts/install.sh" --target "$P7" --hooks >/dev/null
+python3 -c "import json; d=json.load(open('$P7/.claude/settings.local.json')); assert json.dumps(d).count('relay tick --hook') == 2, 'hooks not idempotent'" \
+    || fail "hook install is not idempotent"
+"$ROOT/scripts/uninstall.sh" --target "$P7" >/dev/null
+[ ! -e "$P7/.opencode/plugins/opencode-nudge.js" ] || fail "uninstall left the plugin behind"
+python3 -c "import json,os; p='$P7/.claude/settings.local.json'; assert not os.path.exists(p) or 'relay tick' not in open(p).read(), 'hooks left behind'" \
+    || fail "uninstall left claude hooks behind"
+pass "hooks install and uninstall"
 
 # --- uninstall dry run -----------------------------------------------------
 "$ROOT/scripts/uninstall.sh" --target "$P" --dry-run >/dev/null

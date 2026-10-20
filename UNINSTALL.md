@@ -13,6 +13,8 @@ by default.
 | `AGENTS.md`, `CLAUDE.md` | Marker block removed | same | same |
 | `.gitignore` | `.relay/` line removed | same | same |
 | `.relay/` | moved to `.relay.removed-<timestamp>/` | deleted | kept in place |
+| `.opencode/plugins/opencode-nudge.js` | removed if unmodified | same | removed if unmodified |
+| `.claude/settings.local.json` | our hook entries removed | same | same |
 | `AGENTS.md` / `CLAUDE.md` created by the installer | deleted if still empty | same | same |
 
 Nothing else in the target is modified. Files that the installer created (a

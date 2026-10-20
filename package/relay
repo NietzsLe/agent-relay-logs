@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""relay — per-session work log for multiple agents (schema v3).
+"""relay — per-session work log for multiple agents (schema v4).
 
-Layout (v3):
+Layout (v3+):
   data/YYYY-MM-DD.jsonl   every event of that UTC day, all sessions, one file
   cursors/<session>.json  per-session read cursor: {data file -> byte offset}
+  keys/<key>.json         harness session -> relay session mapping (for hooks)
   data/legacy/            per-session files from v1/v2, kept after migration
 
 One JSON object per line. Event types:
@@ -11,7 +12,16 @@ One JSON object per line. Event types:
   join  — session profile (agent, model, host, cwd, branch, head…)
   start — a task opens: what will be done, how, and how "done" is judged
   note  — while working: progress / problem / decision / result / blocker
+  scope — the working scope changed: files added + why (no exemption is ever
+          written in the docs; the tool detects drift instead)
+  wait  — a long command started: what runs + estimated time (eta)
+  run   — that command finished: actual time, exit code, late/over vs eta
   end   — a task closes: what was done, problems, verification, next steps
+
+Rhythm enforcement (mechanical, not advisory):
+  GAP_MAX (default 600s): a task must log at least every 10 minutes of active
+  work (time inside wait/run windows does not count). `tick` reports the
+  silence; hooks surface it; `end` records it in the score.
 
 Every event type carries detail, because a log that only says "task X started"
 tells the next session nothing useful. See README.md next to this file.
@@ -29,14 +39,18 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "3.1.0"
-SCHEMA = 3
+VERSION = "4.0.0"
+SCHEMA = 4
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 CURSORS = os.path.join(ROOT, "cursors")
+KEYS = os.path.join(ROOT, "keys")
 LEGACY = os.path.join(DATA, "legacy")
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.jsonl$")
 STALE_H = float(os.environ.get("RELAY_STALE_HOURS", "12"))
+GAP_MAX = float(os.environ.get("RELAY_GAP_MAX", "600"))        # hard rhythm limit (s)
+NUDGE_AFTER = float(os.environ.get("RELAY_NUDGE", "480"))      # soft reminder (s)
+MIN_DECLARE = float(os.environ.get("RELAY_MIN_DECLARE", "120"))  # declare above this (s)
 CAP = 25          # maximum lines printed by one sync
 RECENT_DONE = 10  # first sync in a session: number of recently finished items
 MAX_LINE = 8000   # hard cap for one event line (JSON must stay valid)
@@ -50,6 +64,7 @@ LIST_LIMITS = {
     "tags": (12, 60), "refs": (20, 200), "detail": (20, 300), "done": (20, 300),
     "problems": (20, 400), "verify": (12, 300), "metrics": (12, 200),
     "changes": (40, 200), "commits": (10, 60), "next": (12, 300), "lessons": (8, 40),
+    "where": (12, 120), "add": (30, 200),
 }
 TEXT_LIMITS = {
     "title": 120, "goal": 600, "text": 600, "summary": 1000, "impact": 600,
@@ -296,11 +311,222 @@ def who(e):
     return "%s:%s" % (e.get("agent", "?"), e.get("session", "?")[:8])
 
 
+# --------------------------------------------------------------------------- rhythm & score
+def parse_ts(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def task_related(task_id):
+    """All events of one task, oldest first."""
+    out = [e for e in all_events()
+           if e.get("id") == task_id or e.get("task") == task_id]
+    out.sort(key=lambda e: e.get("ts", ""))
+    return out
+
+
+def effective_scope(start_ev, scope_evs):
+    scope = list((start_ev or {}).get("scope") or [])
+    for e in scope_evs or []:
+        scope += e.get("add") or []
+    return scope
+
+
+def git_modified():
+    """Files with uncommitted changes."""
+    out = []
+    for ln in git("status", "--porcelain").splitlines():
+        ln = ln.rstrip()
+        if not ln:
+            continue
+        path = ln[3:] if len(ln) > 3 else ln[2:].strip()
+        if " -> " in path:  # renames: take the new name
+            path = path.split(" -> ")[-1].strip().strip('"')
+        path = path.strip().strip('"')
+        if path:
+            out.append(path)
+    return out
+
+
+def outside_scope(files, scope):
+    if not scope:
+        return []
+    return [f for f in files if not any(overlap([f], [s]) for s in scope)]
+
+
+def run_late_over(eta_s, actual_s):
+    """(late_s, over_s): tolerance both ways so eta cannot be gamed."""
+    eta_s, actual_s = int(eta_s or 0), int(actual_s or 0)
+    if eta_s <= 0:
+        if actual_s > MIN_DECLARE:
+            return int(actual_s - MIN_DECLARE), 0
+        return 0, 0
+    tol = max(60, 0.25 * eta_s)
+    late = max(0, actual_s - eta_s - tol)
+    over = 0
+    if actual_s < eta_s:
+        over = max(0, eta_s - actual_s - max(60, 0.75 * eta_s))
+    return int(late), int(over)
+
+
+def task_timing(task_id, start_ev=None, end_ev=None, now_dt=None):
+    """Rhythm numbers for one task. Wait windows never count as silence."""
+    now_dt = now_dt or datetime.now(timezone.utc)
+    evs = task_related(task_id)
+    if start_ev is None:
+        start_ev = next((e for e in evs if e.get("type") == "start"), None)
+    if end_ev is None:
+        end_ev = next((e for e in evs if e.get("type") == "end"), None)
+    t0 = parse_ts((start_ev or {}).get("ts")) if start_ev else None
+    t1 = (parse_ts(end_ev.get("ts")) or now_dt) if end_ev else now_dt
+    duration = max(0, int((t1 - t0).total_seconds())) if t0 else 0
+    notes = [e for e in evs if e.get("type") == "note"]
+    scopes = [e for e in evs if e.get("type") == "scope"]
+    runs = [e for e in evs if e.get("type") == "run"]
+    waits = [e for e in evs if e.get("type") == "wait"]
+    scope = effective_scope(start_ev, scopes)
+    late_total = sum(int(r.get("late_s") or 0) for r in runs)
+    over_total = sum(int(r.get("over_s") or 0) for r in runs)
+    wait_s = sum(int(r.get("actual_s") or 0) for r in runs)
+    points = []
+    for e in evs:
+        if e.get("type") in ("start", "note", "scope"):
+            t = parse_ts(e.get("ts"))
+            if t:
+                points.append((t, e))
+    for r in runs:
+        t = parse_ts(r.get("ts"))
+        if t:
+            points.append((t, r))
+    if end_ev:
+        t = parse_ts(end_ev.get("ts"))
+        if t:
+            points.append((t, end_ev))
+    points.sort(key=lambda p: p[0])
+    gaps, silence_max = [], 0
+    for (a, _ea), (b, eb) in zip(points, points[1:]):
+        gap = (b - a).total_seconds()
+        if eb.get("type") == "run":
+            gap = max(0, gap - int(eb.get("actual_s") or 0))
+        gaps.append(gap)
+        silence_max = max(silence_max, gap)
+    open_wait = None
+    if not end_ev and waits:
+        last_wait = max(waits, key=lambda e: e.get("ts", ""))
+        runs_after = [r for r in runs if r.get("ts", "") >= last_wait.get("ts", "")]
+        if not runs_after:
+            open_wait = last_wait
+    if open_wait:
+        wt = parse_ts(open_wait.get("ts"))
+        eta = int(open_wait.get("eta_s") or 0)
+        if wt:
+            elapsed = (now_dt - wt).total_seconds()
+            window = max(2 * eta, MIN_DECLARE) if eta > 0 else MIN_DECLARE
+            wait_s += int(min(max(0, elapsed), window))
+            if elapsed > window:
+                gaps.append(elapsed - window)
+                silence_max = max(silence_max, elapsed - window)
+    elif not end_ev and points:
+        # open task, not waiting: the silence since the last log line counts
+        current = (now_dt - points[-1][0]).total_seconds()
+        gaps.append(max(0, current))
+        silence_max = max(silence_max, current)
+    overdue = sum(max(0, g - GAP_MAX) for g in gaps) + late_total + 0.5 * over_total
+    active = max(0, duration - int(wait_s))
+    return {"duration_s": duration, "wait_s": int(wait_s), "active_s": active,
+            "silence_max_s": int(silence_max), "overdue_s": overdue,
+            "late_s": int(late_total), "over_s": int(over_total),
+            "notes": len(notes), "scopes": len(scopes), "runs": len(runs),
+            "scope": scope, "open_wait": open_wait}
+
+
+def task_score(task_id, start_ev=None, end_ev=None, changes=None, forced=False):
+    """Score 0-100: rhythm 50, scope 20, close 20, open 10, forced -10."""
+    tm = task_timing(task_id, start_ev, end_ev)
+    active = max(tm["active_s"], 60)
+    cadence = max(0.0, 50 * (1 - tm["overdue_s"] / active))
+    if changes is None and end_ev:
+        changes = end_ev.get("changes") or []
+    drift = outside_scope(changes or [], tm["scope"]) if tm["scope"] else []
+    scope_pts = max(0, 20 - 10 * len(drift))
+    close = 0
+    if end_ev:
+        if end_ev.get("summary"):
+            close += 6
+        if end_ev.get("done"):
+            close += 4
+        if end_ev.get("verify"):
+            close += 6
+        if end_ev.get("next"):
+            close += 4
+    open_pts = 0
+    if start_ev:
+        if start_ev.get("goal"):
+            open_pts += 4
+        if start_ev.get("plan"):
+            open_pts += 3
+        if start_ev.get("scope"):
+            open_pts += 3
+    total = cadence + scope_pts + close + open_pts - (10 if forced else 0)
+    return {"score": max(0, int(round(total))), "cadence": round(cadence, 1),
+            "scope": scope_pts, "close": close, "open": open_pts,
+            "silence_max_s": tm["silence_max_s"], "overdue_s": round(tm["overdue_s"], 1),
+            "wait_s": tm["wait_s"], "late_s": tm["late_s"], "over_s": tm["over_s"],
+            "scope_drift": drift, "forced": forced, "notes": tm["notes"]}
+
+
+def end_gate(task_id, start_ev, changes, status):
+    """Hard, checkable gate at close time. Returns (gate list, timing)."""
+    tm = task_timing(task_id, start_ev, None)
+    gate = []
+    if tm["silence_max_s"] > GAP_MAX:
+        gate.append("im lặng %ds quá hạn %ds (wait đã trừ)"
+                    % (tm["silence_max_s"], int(GAP_MAX)))
+    if tm["late_s"] > 0:
+        gate.append("ước tính lệnh sai: trễ %ds quá tolerance" % tm["late_s"])
+    drift = outside_scope(changes or [], tm["scope"]) if tm["scope"] else []
+    if drift:
+        gate.append("ngoài scope chưa log: %s" % ", ".join(drift[:5]))
+    return gate, tm, drift
+
+
 # --------------------------------------------------------------------------- session
 def explicit_agent(args):
     if getattr(args, "agent", None):
         return args.agent
     return os.environ.get("RELAY_AGENT") or None
+
+
+def key_name(args):
+    return getattr(args, "key", None) or os.environ.get("RELAY_KEY") or None
+
+
+def key_file(key):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key or "")[:64] or "default"
+    return os.path.join(KEYS, safe + ".json")
+
+
+def load_key(key):
+    try:
+        with open(key_file(key), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        sid = data.get("session") if isinstance(data, dict) else None
+        return sid or None
+    except (OSError, ValueError):
+        return None
+
+
+def save_key(key, sid):
+    try:
+        os.makedirs(KEYS, exist_ok=True)
+        tmp = key_file(key) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"session": sid, "updated": now()}, f)
+        os.replace(tmp, key_file(key))
+    except OSError:
+        pass
 
 
 def session_agent(sid):
@@ -318,10 +544,54 @@ def resolve_agent(sid, args):
 def session_id(args):
     sid = args.session or os.environ.get("RELAY_SESSION")
     new = False
+    key = key_name(args)
+    if not sid and key:
+        sid = load_key(key)
+    if key and sid:
+        save_key(key, sid)
     if not sid:
         sid = "%s-%s" % (explicit_agent(args) or "agent", rid())
         new = True
+        if key:
+            save_key(key, sid)
     return sid, new
+
+
+def existing_sid(args):
+    """Resolve a session id without creating anything (for tick/guard)."""
+    sid = args.session or os.environ.get("RELAY_SESSION")
+    if sid:
+        return sid
+    key = key_name(args)
+    if key:
+        return load_key(key)
+    return None
+
+
+def parse_dur(text):
+    """Parse '8m', '90s', '1h30m', '500' into seconds. None when unparsable."""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return int(text)
+    s = str(text).strip().lower().replace(" ", "")
+    if not s:
+        return None
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return int(float(s))
+    total, num = 0, ""
+    units = {"h": 3600, "m": 60, "s": 1}
+    for ch in s:
+        if ch.isdigit() or ch == ".":
+            num += ch
+        elif ch in units and num:
+            total += float(num) * units[ch]
+            num = ""
+        else:
+            return None
+    if num:
+        return None
+    return int(total)
 
 
 def ensure_join(sid, args):
@@ -386,9 +656,33 @@ def fmt(e, tasks, full=False):
     if typ == "note":
         lines = ["  · %s %s [%s] %s" % (t, e.get("task", "?"), e.get("kind", "note"),
                                         e.get("text", "") if full else one(e.get("text", "")))]
+        if e.get("next"):
+            lines.append("    next: " + (e["next"] if full else one(e["next"])))
         for d in (e.get("detail") or []):
             lines.append("      - " + d)
+        if e.get("where"):
+            lines.append("    where: " + ", ".join(e["where"][:6]))
+        if e.get("refs"):
+            lines.append("    refs: " + ", ".join(e["refs"][:8]))
         return lines
+
+    if typ == "scope":
+        lines = ["  + %s %s scope +%s" % (t, e.get("task", "?"),
+                                          ", ".join((e.get("add") or [])[:6]))]
+        if e.get("why"):
+            lines.append("    why: " + (e["why"] if full else one(e["why"])))
+        return lines
+
+    if typ == "run":
+        flag = ""
+        if e.get("late_s"):
+            flag = "  LATE +%ds" % e["late_s"]
+        elif e.get("over_s"):
+            flag = "  (over +%ds)" % e["over_s"]
+        return ["  = %s %s run %s %s (eta %s) exit %s%s"
+                % (t, e.get("task", "?"), one(e.get("cmd", ""), 80),
+                   fmt_duration(e.get("actual_s")), fmt_duration(e.get("eta_s")),
+                   e.get("exit", "?"), flag)]
 
     if typ == "end":
         st = tasks.get(e.get("task"))
@@ -488,13 +782,16 @@ def sync(sid, all_=False, first=False, full=False, only=None):
         done_events = [e for e in others if e.get("type") == "end"][-RECENT_DONE:]
         done_ids = {e.get("task") for e in done_events}
         new = [e for e in others if e.get("type") == "start" and e["id"] in open_ids]
-        new += [e for e in others if e.get("type") == "note" and e.get("task") in open_ids]
+        new += [e for e in others if e.get("type") in ("note", "scope", "run")
+                and e.get("task") in open_ids]
         # the plan/goal of a finished task is context worth showing too
         new += [e for e in others if e.get("type") == "start" and e["id"] in done_ids]
-        new += [e for e in others if e.get("type") == "note" and e.get("task") in done_ids]
+        new += [e for e in others if e.get("type") in ("note", "scope", "run")
+                and e.get("task") in done_ids]
         new += done_events
     # a session never sees its own events as "somebody else's news"
-    new = [e for e in new if e.get("type") in ("start", "note", "end") and e.get("session") != sid]
+    new = [e for e in new if e.get("type") in ("start", "note", "end", "scope", "run")
+           and e.get("session") != sid]
     if only:
         new = [e for e in new if e.get("task") == only or e.get("id") == only]
     new.sort(key=lambda e: e.get("ts", ""))
@@ -502,6 +799,7 @@ def sync(sid, all_=False, first=False, full=False, only=None):
         save_cursor(sid, cur)
     if not new:
         return
+    parallel = board_lines(sid, limit=5, only_others=True)
     hot = lambda e: (overlap(my_scope, e.get("scope", []) or e.get("changes", []))
                      or bool(my_tags & set(e.get("tags", []))))
     lines = []
@@ -513,10 +811,15 @@ def sync(sid, all_=False, first=False, full=False, only=None):
     stale = {e["id"] for evs in allev.values() for e in open_tasks(evs) if age_h(e["ts"]) > STALE_H}
     lines = [l + ("  (possibly abandoned)" if any(i in l for i in stale) and "▶" in l else "") for l in lines]
     print(NOTE)
+    if parallel:
+        print("◆ đang chạy song song (%d):" % len(parallel))
+        for pl in parallel:
+            print("  " + pl)
     if not all_ and len(lines) > CAP:
         extra = len(lines) - CAP
         lines = lines[:CAP] + ["  … +%d more lines (relay sync --all)" % extra]
-    print("\n".join(lines))
+    if lines:
+        print("\n".join(lines))
 
 
 def warn_quality(typ, fields):
@@ -555,23 +858,283 @@ def open_report(stale_only=False):
         print("no %sopen tasks" % ("stale " if stale_only else ""))
 
 
+def open_report(stale_only=False):
+    """Print every open task across all sessions, oldest first, stale ones flagged."""
+    rows = []
+    for fn in data_files():
+        evs, _ = read_file(fn)
+        rows += open_tasks(evs)
+    # a task may span days: drop tasks closed in a later day file
+    closed = {e.get("task") for e in all_events() if e.get("type") == "end"}
+    rows = [t for t in rows if t["id"] not in closed]
+    rows.sort(key=lambda e: e.get("ts", ""))
+    shown = 0
+    for t in rows:
+        age = age_h(t["ts"])
+        stale = age > STALE_H
+        if stale_only and not stale:
+            continue
+        shown += 1
+        print("%s %s [%s] %s  (%.1fh%s)" % ("?" if stale else "▶", t["id"], who(t),
+                                           t.get("title", ""), age,
+                                           ", possibly abandoned" if stale else ""))
+    if not shown:
+        print("no %sopen tasks" % ("stale " if stale_only else ""))
+
+
+def task_now_next(task_id):
+    """(now_text, next_text) from the latest activity of a task."""
+    rel = task_related(task_id)
+    start = next((e for e in rel if e.get("type") == "start"), None)
+    now_txt = (start or {}).get("title", "?")
+    next_txt = None
+    for e in reversed(rel):
+        typ = e.get("type")
+        if typ == "note":
+            if now_txt == (start or {}).get("title", "?") or True:
+                if e.get("text"):
+                    now_txt = one(e["text"], 100)
+            if e.get("next") and next_txt is None:
+                next_txt = one(e["next"], 100)
+            break
+        if typ == "run":
+            now_txt = "run xong: %s (%s, exit %s)" % (
+                one(e.get("cmd", ""), 60), fmt_duration(e.get("actual_s")),
+                e.get("exit", "?"))
+            break
+        if typ == "scope":
+            now_txt = "mở rộng scope: %s" % ", ".join((e.get("add") or [])[:3])
+            break
+        if typ == "wait":
+            eta = fmt_duration(e.get("eta_s")) or "?"
+            now_txt = "đang chờ: %s (eta %s)" % (one(e.get("cmd", ""), 60), eta)
+            break
+    if next_txt is None:
+        for e in reversed(rel):
+            if e.get("type") == "note" and e.get("next"):
+                next_txt = one(e["next"], 100)
+                break
+    return now_txt, next_txt or "—"
+
+
+def board_lines(sid=None, limit=10, only_others=False):
+    """One line per open task: now · next · scope clash. For board and sync."""
+    mine_scope = []
+    if sid:
+        mine = session_events(sid)
+        mine_scope = [s for t in open_tasks(mine) for s in t.get("scope", [])]
+    closed = {e.get("task") for e in all_events() if e.get("type") == "end"}
+    rows, seen = [], set()
+    for e in all_events():
+        if e.get("type") == "start" and e["id"] not in closed and e["id"] not in seen:
+            seen.add(e["id"])
+            rows.append(e)
+    rows.sort(key=lambda e: e.get("ts", ""))
+    out = []
+    for t in rows:
+        if only_others and sid and t.get("session") == sid:
+            continue
+        if len(out) >= limit:
+            break
+        now_txt, next_txt = task_now_next(t["id"])
+        scopes = [e for e in task_related(t["id"]) if e.get("type") == "scope"]
+        clash = ""
+        if sid and t.get("session") != sid and mine_scope:
+            if overlap(mine_scope, effective_scope(t, scopes)):
+                clash = "  ⚠ trùng scope với bạn"
+        age = age_h(t["ts"])
+        stale = "  (idle %.0fh)" % age if age > STALE_H else ""
+        out.append("▶ %s [%s] %s — now: %s — next: %s%s%s"
+                   % (t["id"], who(t), t.get("title", ""), now_txt, next_txt,
+                      clash, stale))
+    return out
+
+
+def board(sid=None):
+    lines = board_lines(sid)
+    if not lines:
+        print("không có task nào đang mở")
+        return
+    print("board — %d task đang mở:" % len(lines))
+    for ln in lines:
+        print("  " + ln)
+
+
+def peek_unread(sid):
+    """Count unread start/note/end/scope/run events from other sessions."""
+    cur = load_cursor(sid)
+    n, by_agent = 0, {}
+    for fn in data_files():
+        evs, _off = read_file(fn, cur.get(fn, 0))
+        for e in evs:
+            if e.get("type") in ("start", "note", "end", "scope", "run") \
+                    and e.get("session") != sid:
+                n += 1
+                by_agent[e.get("agent", "?")] = by_agent.get(e.get("agent", "?"), 0) + 1
+    return n, by_agent
+
+
+def tick(sid=None, as_json=False):
+    """One-line rhythm/scope/coordination check. Exit 2 on violation, else 0.
+
+    Never blocks, never writes. Order: no-task-with-changes → expired wait →
+    silence overdue → scope drift → unread news → silence.
+    """
+    now_dt = datetime.now(timezone.utc)
+    result = {"ok": True, "messages": [], "unread": 0, "silence_s": 0,
+              "drift": [], "exit": 0}
+
+    def emit(msg, violation):
+        result["messages"].append(msg)
+        if violation:
+            result["ok"] = False
+            result["exit"] = 2
+
+    if sid is None:
+        stale = [t for t in board_lines(None) if "(idle" in t]
+        if stale:
+            emit("relay: %d task mở quá %dh chưa ai đóng — relay open --stale" % (len(stale), int(STALE_H)), False)
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            for m in result["messages"]:
+                print(m)
+        return result["exit"]
+
+    mine = session_events(sid)
+    opn = open_tasks(mine)
+    if not opn:
+        if git_modified():
+            emit("relay: repo có thay đổi nhưng chưa có task mở — relay start \"…\" --scope <path>", True)
+        n, _by = peek_unread(sid)
+        result["unread"] = n
+        if n:
+            emit("relay: %d sự kiện mới từ phiên khác — relay sync" % n, False)
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            for m in result["messages"]:
+                print(m)
+        return result["exit"]
+
+    task = opn[-1]
+    tm = task_timing(task["id"], task, None, now_dt)
+    result["silence_s"] = tm["silence_max_s"]
+    modified = git_modified()
+    drift = outside_scope(modified, tm["scope"]) if tm["scope"] else []
+    result["drift"] = drift
+    if tm["open_wait"]:
+        eta = int(tm["open_wait"].get("eta_s") or 0)
+        wt = parse_ts(tm["open_wait"].get("ts"))
+        elapsed = int((now_dt - wt).total_seconds()) if wt else 0
+        window = max(2 * eta, MIN_DECLARE) if eta > 0 else MIN_DECLARE
+        if elapsed > window:
+            emit("relay: chờ quá 2×eta (%s quá %s) mà chưa có run — ước tính sai hoặc lệnh treo"
+                 % (fmt_duration(elapsed), fmt_duration(window)), True)
+    if tm["silence_max_s"] > GAP_MAX:
+        emit("relay: %s chưa ghi (task %s) — relay note --kind progress --text \"…\" --next \"…\""
+             % (fmt_duration(tm["silence_max_s"]), task["id"]), True)
+    elif tm["silence_max_s"] > NUDGE_AFTER:
+        emit("relay: đã im %s (task %s, hạn %s) — ghi 1 dòng note"
+             % (fmt_duration(tm["silence_max_s"]), task["id"], fmt_duration(GAP_MAX)), False)
+    if drift:
+        emit("relay: %d file ngoài scope (%s) — relay scope --add <path> --why \"…\""
+             % (len(drift), ", ".join(drift[:3])), True)
+    n, _by = peek_unread(sid)
+    result["unread"] = n
+    if n:
+        emit("relay: %d sự kiện mới từ phiên khác — relay sync" % n, False)
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for m in result["messages"]:
+            print(m)
+    return result["exit"]
+
+
+def guard_stop(sid, payload):
+    """Claude Code Stop hook: block once when the agent would leave silently."""
+    if isinstance(payload, dict) and payload.get("stop_hook_active"):
+        return 0
+    if not sid:
+        return 0
+    mine = session_events(sid)
+    opn = open_tasks(mine)
+    if not opn:
+        return 0
+    task = opn[-1]
+    tm = task_timing(task["id"], task, None)
+    if tm["silence_max_s"] <= GAP_MAX:
+        return 0
+    print("relay: task %s im lặng %dm (hạn %dm). Ghi 1 dòng rồi hãy kết thúc:\n"
+          "  relay --session %s note --kind progress --text \"…\" --next \"…\""
+          % (task["id"], tm["silence_max_s"] // 60, int(GAP_MAX // 60), sid))
+    return 2
+
+
+def stats_lines():
+    """Aggregate quality numbers over all closed tasks."""
+    starts = [e for e in all_events() if e.get("type") == "start"]
+    ends = {e.get("task"): e for e in all_events() if e.get("type") == "end"}
+    closed = [(s, ends[s["id"]]) for s in starts if s["id"] in ends]
+    lines = ["tasks: %d (%d đang mở)" % (len(starts), len(starts) - len(closed))]
+    if not closed:
+        return lines
+    scores, silences, notes_n, fails, forced_n = [], [], [], 0, 0
+    by_agent = {}
+    for s, e in closed:
+        sc = task_score(s["id"], s, e, forced=bool(e.get("forced")))
+        scores.append(sc["score"])
+        silences.append(sc["silence_max_s"])
+        notes_n.append(sc["notes"])
+        if e.get("gate"):
+            fails += 1
+        if e.get("forced"):
+            forced_n += 1
+        by_agent.setdefault(s.get("agent", "?"), []).append(sc["score"])
+    notes_n.sort()
+    lines.append("score TB: %d · note/task (median): %d · im lặng max: %s"
+                 % (sum(scores) // len(scores), notes_n[len(notes_n) // 2],
+                    fmt_duration(max(silences))))
+    lines.append("gate fail: %d · forced: %d · done thiếu verify: %d"
+                 % (fails, forced_n,
+                    sum(1 for _s, e in closed if e.get("status") == "done" and not e.get("verify"))))
+    for agent, ss in sorted(by_agent.items()):
+        lines.append("  %s: %d (n=%d)" % (agent, sum(ss) // len(ss), len(ss)))
+    return lines
+
+
+def stats():
+    for ln in stats_lines():
+        print(ln)
+
+
 # --------------------------------------------------------------------------- show
 def find_task(task_id):
-    """Return (start_event, [notes], end_event) for a task id, searching every session."""
-    start = notes = end = None
+    """Return (start, notes, end, extras) for a task id, searching every session."""
+    start = end = None
+    notes, scopes, waits, runs = [], [], [], []
     for ev in all_events():
         if ev.get("type") == "start" and ev.get("id") == task_id:
             start = ev
         elif ev.get("type") == "note" and ev.get("task") == task_id:
-            notes = (notes or []) + [ev]
+            notes.append(ev)
+        elif ev.get("type") == "scope" and ev.get("task") == task_id:
+            scopes.append(ev)
+        elif ev.get("type") == "wait" and ev.get("task") == task_id:
+            waits.append(ev)
+        elif ev.get("type") == "run" and ev.get("task") == task_id:
+            runs.append(ev)
         elif ev.get("type") == "end" and ev.get("task") == task_id:
             end = ev
-    return start, notes or [], end
+    return start, notes, end, {"scopes": scopes, "waits": waits, "runs": runs}
 
 
-def render_task(start, notes, end, as_json=False):
+def render_task(start, notes, end, as_json=False, extras=None):
+    extras = extras or {"scopes": [], "waits": [], "runs": []}
     if as_json:
-        for ev in ([start] if start else []) + notes + ([end] if end else []):
+        for ev in ([start] if start else []) + notes + extras["scopes"] \
+                + extras["waits"] + extras["runs"] + ([end] if end else []):
             print(json.dumps(ev, ensure_ascii=False, indent=2))
         return
     out = []
@@ -605,8 +1168,24 @@ def render_task(start, notes, end, as_json=False):
         out.append("  notes (%d):" % len(notes))
         for n in notes:
             out.append("    [%s] %s" % (n.get("kind", "note"), n.get("text", "")))
+            if n.get("next"):
+                out.append("      next: %s" % n["next"])
             for d in (n.get("detail") or []):
                 out.append("      - %s" % d)
+            if n.get("where"):
+                out.append("      where: %s" % ", ".join(n["where"]))
+    for sc in extras["scopes"]:
+        out.append("  scope +%s (%s)" % (", ".join(sc.get("add") or []), sc.get("why", "")))
+    for r in extras["runs"]:
+        flag = " LATE +%ds" % r["late_s"] if r.get("late_s") else ""
+        out.append("  run %s: %s, exit %s%s" % (r.get("cmd", ""),
+                  fmt_duration(r.get("actual_s")), r.get("exit", "?"), flag))
+    if end and end.get("score") is not None:
+        out.append("  score: %d (nhịp %s · scope %s · kết thúc %s · mở %s)"
+                   % (end["score"], end.get("cadence", "?"), end.get("scope_pts", "?"),
+                      end.get("close_pts", "?"), end.get("open_pts", "?")))
+        if end.get("gate"):
+            out.append("  gate: %s" % "; ".join(end["gate"]))
     print("\n".join(out))
 
 
@@ -652,6 +1231,8 @@ def doctor():
             and e.get("status") == "done"]
     if thin:
         print("  %d 'done' task(s) closed without --verify" % len(thin))
+    for ln in stats_lines():
+        print("  " + ln)
     legacy = legacy_files()
     if legacy:
         print("legacy per-session files: %s (run 'relay migrate' to fold them into the day files)"
@@ -667,6 +1248,7 @@ def build_parser():
     p = argparse.ArgumentParser(prog="relay", description="Cross-agent work log.")
     p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--session", help="session id (else $RELAY_SESSION)")
+    p.add_argument("--key", help="harness key mapped to a session (else $RELAY_KEY)")
     p.add_argument("--agent", help="agent name (else $RELAY_AGENT, else the session's own name)")
     p.add_argument("--model", default=os.environ.get("RELAY_MODEL", ""))
 
@@ -678,16 +1260,39 @@ def build_parser():
     add_list_arg(s, "plan", "one step of the plan (repeatable)")
     add_list_arg(s, "accept", "acceptance criteria / definition of done (repeatable)")
     add_list_arg(s, "out", "explicitly out of scope (repeatable)")
-    add_list_arg(s, "scope", "paths expected to be touched (repeatable, comma ok)")
+    s.add_argument("--scope", action="append", default=[], help="paths expected to be touched (repeatable, comma ok)")
     add_list_arg(s, "tags", "keywords to make the work findable (repeatable, comma ok)")
     add_list_arg(s, "refs", "codes/URLs: T-65, L-42, #123 (repeatable, comma ok)")
 
     n = sub.add_parser("note", help="log progress, a problem, a decision, a result, a blocker")
     n.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
     n.add_argument("--kind", default="progress", choices=list(KINDS))
-    n.add_argument("--text", required=True, help="what happened (≤600 chars, multi-line ok)")
+    n.add_argument("--text", required=True, help="what happened, one line (≤160 chars)")
+    n.add_argument("--next", default="", help="the next step, one line (≤160 chars)")
     add_list_arg(n, "detail", "extra lines: error output, measurements, context (repeatable)")
+    add_list_arg(n, "where", "where to look: file:line, service, endpoint (repeatable, comma ok)")
     add_list_arg(n, "refs", "codes/URLs (repeatable, comma ok)")
+
+    sc = sub.add_parser("scope", help="log that the working scope changed")
+    sc.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
+    sc.add_argument("--add", action="append", default=[], required=True,
+                    help="paths added to the scope (repeatable, comma ok)")
+    sc.add_argument("--why", default="", required=True, help="why the scope changed (≤300 chars)")
+
+    w = sub.add_parser("wait", help="declare a long command before running it")
+    w.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
+    w.add_argument("--eta", default="", help="estimated time: 8m, 90s, 1h30m (required above RELAY_MIN_DECLARE)")
+    w.add_argument("--cmd", dest="cmd_text", default="", required=True, help="the command about to run")
+
+    r = sub.add_parser("run", help="run a long command with timing, or record one")
+    r.add_argument("--task", default=None, help="task id (default: the open task of this session)")
+    r.add_argument("--eta", default="", help="estimated time: 8m, 90s, 1h30m")
+    r.add_argument("--cmd", dest="cmd_text", default="", help="the command (required with --record or --)")
+    r.add_argument("--record", action="store_true",
+                   help="do not execute; only record a measurement taken by a hook")
+    r.add_argument("--actual", default="", help="measured time with --record (e.g. 95s)")
+    r.add_argument("--exit", default=0, type=int, help="exit code with --record")
+    r.add_argument("command", nargs=argparse.REMAINDER, help="command to execute after --")
 
     e = sub.add_parser("end", help="close a task: what was done, problems, verification, next")
     e.add_argument("task", nargs="?", help="task id (default: the open task of this session)")
@@ -697,12 +1302,13 @@ def build_parser():
     add_list_arg(e, "problem", "problem → resolution, or problem (UNRESOLVED) (repeatable)")
     add_list_arg(e, "verify", "how it was verified and the result (repeatable)")
     add_list_arg(e, "metric", "before → after (n=…, window=…) (repeatable)")
-    add_list_arg(e, "changes", "files/dirs changed (repeatable, comma ok)")
+    e.add_argument("--changes", action="append", default=[], help="files/dirs changed (repeatable, comma ok)")
     add_list_arg(e, "commit", "commit sha (repeatable, comma ok)")
     add_list_arg(e, "next", "open item / next step (repeatable)")
     add_list_arg(e, "lesson", "lesson code, e.g. L-42 (repeatable, comma ok)")
     add_list_arg(e, "refs", "codes/URLs (repeatable, comma ok)")
     e.add_argument("--impact", default="", help="what the next person must know (≤600 chars)")
+    e.add_argument("--force", action="store_true", help="close despite gate violations (recorded)")
 
     y = sub.add_parser("sync", help="print what other sessions did since your last sync")
     y.add_argument("--all", action="store_true", help="full history, do not advance the cursor")
@@ -718,6 +1324,17 @@ def build_parser():
 
     op = sub.add_parser("open", help="list open tasks of every session (stale ones flagged)")
     op.add_argument("--stale", action="store_true", help="only tasks older than RELAY_STALE_HOURS")
+
+    bd = sub.add_parser("board", help="open tasks with now/next/scope-clash lines")
+
+    tk = sub.add_parser("tick", help="rhythm check: at most one line, exit 2 on violation")
+    tk.add_argument("--json", action="store_true", help="machine-readable result")
+    tk.add_argument("--hook", action="store_true", help="same as tick (for hook commands)")
+
+    gd = sub.add_parser("guard", help="hook guards")
+    gd.add_argument("--stop", action="store_true", help="Claude Code Stop hook: block once when silent too long")
+
+    sub.add_parser("stats", help="aggregate quality numbers over closed tasks")
     sub.add_parser("doctor", help="health check")
     sub.add_parser("version", help="print the version")
     return p
@@ -775,6 +1392,27 @@ def main():
     if args.cmd == "open":
         open_report(args.stale)
         return
+    if args.cmd == "board":
+        board(existing_sid(args))
+        return
+    if args.cmd == "stats":
+        stats()
+        return
+    if args.cmd == "tick":
+        return tick(existing_sid(args), args.json or args.hook)
+    if args.cmd == "guard":
+        if args.stop:
+            payload = {}
+            try:
+                if not sys.stdin.isatty():
+                    raw = sys.stdin.read()
+                    if raw.strip():
+                        payload = json.loads(raw)
+            except Exception:
+                payload = {}
+            return guard_stop(existing_sid(args), payload)
+        print("[relay] guard needs --stop", file=sys.stderr)
+        return 2
     if args.cmd == "migrate":
         report = migrate(args.dry_run)
         for line in report:
@@ -805,8 +1443,8 @@ def main():
         if not task:
             print("[relay] không tìm thấy task; truyền rõ task id", file=sys.stderr)
             return
-        start, notes, end = find_task(task)
-        render_task(start, notes, end, args.json)
+        start, notes, end, extras = find_task(task)
+        render_task(start, notes, end, args.json, extras)
     elif args.cmd == "start":
         sync(sid, first=first)
         scope = flat(args.scope)
@@ -838,18 +1476,106 @@ def main():
         ev.update({
             "task": task,
             "kind": args.kind,
-            "text": clip_text(args.text, TEXT_LIMITS["text"]),
+            "text": clip_text(args.text, 160),
+            "next": clip_text(args.next, 160),
             "detail": clip_list(args.detail, *LIST_LIMITS["detail"]),
+            "where": clip_list(flat(args.where), *LIST_LIMITS["where"]),
             "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
         })
         append(sid, ev)
         print("note=%s task=%s" % (ev["id"], task))
+    elif args.cmd == "scope":
+        task = pick_task(sid, args, allow_session_last=True)
+        if not task:
+            print("[relay] không có task để ghi scope; truyền rõ task id", file=sys.stderr)
+            return
+        add = clip_list(flat(args.add), *LIST_LIMITS["add"])
+        ev = base(sid, args, "scope")
+        ev.update({"task": task, "add": add, "why": clip_text(args.why, 300)})
+        append(sid, ev)
+        print("scope=%s task=%s +%s" % (ev["id"], task, ", ".join(add)))
+    elif args.cmd == "wait":
+        task = pick_task(sid, args, allow_session_last=True)
+        if not task:
+            print("[relay] không có task để ghi wait; truyền rõ task id", file=sys.stderr)
+            return
+        ev = base(sid, args, "wait")
+        ev.update({"task": task, "cmd": clip_text(args.cmd_text, 300),
+                   "eta_s": parse_dur(args.eta) or 0})
+        append(sid, ev)
+        print("wait=%s task=%s eta=%s cmd=%s"
+              % (ev["id"], task, fmt_duration(ev["eta_s"]) or "?", ev["cmd"]))
+    elif args.cmd == "run":
+        task = pick_task(sid, args, allow_session_last=True)
+        if not task:
+            print("[relay] không có task để ghi run; truyền rõ task id", file=sys.stderr)
+            return
+        if args.record:
+            cmd = args.cmd_text or " ".join(args.command).lstrip("- ").strip()
+            if not cmd:
+                print("[relay] run --record cần --cmd", file=sys.stderr)
+                return 2
+            actual = parse_dur(args.actual)
+            if actual is None:
+                print("[relay] run --record cần --actual <thời gian đo được>", file=sys.stderr)
+                return 2
+            eta = parse_dur(args.eta) or 0
+            late, over = run_late_over(eta, actual)
+            ev = base(sid, args, "run")
+            ev.update({"task": task, "cmd": clip_text(cmd, 300), "eta_s": eta,
+                       "actual_s": actual, "exit": args.exit,
+                       "late_s": late, "over_s": over})
+            append(sid, ev)
+            print("run=%s task=%s %s (eta %s) exit %d%s"
+                  % (ev["id"], task, fmt_duration(actual), fmt_duration(eta) or "?",
+                     args.exit, " LATE +%ds" % late if late else ""))
+            return 0
+        cmd = [c for c in (args.command or [])]
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd and not args.cmd_text:
+            print("[relay] run cần lệnh: relay run -- <lệnh>  (hoặc --record)", file=sys.stderr)
+            return 2
+        if not cmd:
+            import shlex
+            cmd = shlex.split(args.cmd_text)
+        eta = parse_dur(args.eta) or 0
+        w = base(sid, args, "wait")
+        w.update({"task": task, "cmd": clip_text(" ".join(cmd), 300), "eta_s": eta})
+        append(sid, w)
+        t0 = time.time()
+        try:
+            proc = subprocess.run(cmd)
+            rc = proc.returncode
+        except FileNotFoundError:
+            print("[relay] không chạy được: %s" % cmd[0], file=sys.stderr)
+            return 127
+        actual = int(time.time() - t0)
+        late, over = run_late_over(eta, actual)
+        ev = base(sid, args, "run")
+        ev.update({"task": task, "cmd": clip_text(" ".join(cmd), 300), "eta_s": eta,
+                   "actual_s": actual, "exit": rc, "late_s": late, "over_s": over})
+        append(sid, ev)
+        print("run=%s task=%s %s (eta %s) exit %d%s"
+              % (ev["id"], task, fmt_duration(actual), fmt_duration(eta) or "?",
+                 rc, " LATE +%ds" % late if late else ""))
+        return rc
     elif args.cmd == "end":
         task = pick_task(sid, args)
+        reclose = False
+        if not task and args.force:
+            # accept the penalty on the session's latest gate-failed close
+            started = [e for e in session_events(sid) if e.get("type") == "start"]
+            for s in reversed(started):
+                _st, _no, en, _ex = find_task(s["id"])
+                if en and en.get("gate") and not en.get("forced"):
+                    task = s["id"]
+                    reclose = True
+                    break
         if not task:
             print("[relay] không có việc đang dở để kết thúc", file=sys.stderr)
             return
-        start, notes, _end = find_task(task)
+        start, notes, _end, _ex = find_task(task)
         duration = 0
         if start:
             try:
@@ -857,6 +1583,12 @@ def main():
                 duration = int((datetime.now(timezone.utc) - t0).total_seconds())
             except (KeyError, ValueError):
                 duration = 0
+        changes = clip_list(flat(args.changes), *LIST_LIMITS["changes"])
+        verify = clip_list(args.verify, *LIST_LIMITS["verify"])
+        gate, _tm, drift = end_gate(task, start, changes, args.status)
+        if args.status == "done" and not verify:
+            gate.append("done nhưng thiếu --verify")
+        forced = bool(args.force and (gate or reclose))
         ev = base(sid, args, "end")
         ev.update({
             "task": task,
@@ -864,9 +1596,9 @@ def main():
             "summary": clip_text(args.summary, TEXT_LIMITS["summary"]),
             "done": clip_list(args.done, *LIST_LIMITS["done"]),
             "problems": clip_list(args.problem, *LIST_LIMITS["problems"]),
-            "verify": clip_list(args.verify, *LIST_LIMITS["verify"]),
+            "verify": verify,
             "metrics": clip_list(args.metric, *LIST_LIMITS["metrics"]),
-            "changes": clip_list(flat(args.changes), *LIST_LIMITS["changes"]),
+            "changes": changes,
             "commits": clip_list(flat(args.commit), *LIST_LIMITS["commits"]),
             "impact": clip_text(args.impact, TEXT_LIMITS["impact"]),
             "next": clip_list(args.next, *LIST_LIMITS["next"]),
@@ -874,18 +1606,36 @@ def main():
             "refs": clip_list(flat(args.refs), *LIST_LIMITS["refs"]),
             "duration_s": duration,
             "notes": len(notes),
+            "gate": gate,
+            "forced": forced,
         })
+        sc = task_score(task, start, ev, changes, forced)
+        ev.update({"score": sc["score"], "cadence": sc["cadence"], "scope_pts": sc["scope"],
+                   "close_pts": sc["close"], "open_pts": sc["open"],
+                   "silence_max_s": sc["silence_max_s"], "overdue_s": sc["overdue_s"],
+                   "wait_s": sc["wait_s"], "late_s": sc["late_s"],
+                   "scope_drift": sc["scope_drift"]})
         append(sid, ev)
-        if ev["status"] == "done":
-            warn_quality("end", ev)
-        print("ended=%s status=%s duration=%s notes=%d"
-              % (task, ev["status"], fmt_duration(duration), len(notes)))
+        if gate and not forced:
+            print("ended=%s status=%s duration=%s notes=%d score=%d"
+                  % (task, ev["status"], fmt_duration(duration), len(notes), sc["score"]))
+            print("GATE: %s" % "; ".join(gate), file=sys.stderr)
+            print("task đã đóng với điểm %d. Chạy lại với --force để chấp nhận phạt."
+                  % sc["score"], file=sys.stderr)
+            return 1
+        if forced:
+            print("ended=%s status=%s duration=%s notes=%d score=%d forced=true"
+                  % (task, ev["status"], fmt_duration(duration), len(notes), sc["score"]))
+        else:
+            print("ended=%s status=%s duration=%s notes=%d score=%d"
+                  % (task, ev["status"], fmt_duration(duration), len(notes), sc["score"]))
         sync(sid)
+        return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main() or 0)
     except SystemExit:
         raise
     except Exception as ex:  # logging must never block the main work

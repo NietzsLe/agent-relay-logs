@@ -1,4 +1,4 @@
-# `.relay` — per-session work log for multiple agents (schema v3)
+# `.relay` — per-session work log for multiple agents (schema v4)
 
 A small, self-contained system that can be copied into another project. Goal:
 agent sessions (Claude, OpenCode, Codex, …) working in the same repository can
@@ -12,6 +12,8 @@ they understand the environment without asking the user again.
 ├── relay              the CLI
 ├── README.md          this file
 ├── SNIPPET.md         short usage snippet
+├── keys/
+│   └── <key>.json     harness session → relay session mapping (for hooks)
 ├── data/
 │   ├── 2026-10-19.jsonl   every event of that UTC day — all sessions, one file
 │   ├── 2026-10-20.jsonl
@@ -50,8 +52,11 @@ event type therefore carries the context that a reader needs:
 |---|---|---|
 | `join` | Who/where am I? | agent, model, user, host, pid, cwd, project, branch, head, worktree, dirty |
 | `start` | **What will be done, how, and how is it judged done?** | title, goal, plan, accept, outs, scope, tags, refs |
-| `note` | **What is happening right now, what went wrong, what was decided?** | task, kind (progress/problem/decision/result/blocker/question), text, detail, refs |
-| `end` | **What was done, what broke, how was it verified, what is left?** | status, summary, done, problems, verify, metrics, changes, commits, impact, next, lessons, refs, duration_s, notes |
+| `note` | **What just happened + what is next?** | task, kind (progress/problem/decision/result/blocker/question), text (1 line), next (1 line), detail, where, refs |
+| `scope` | **The working scope changed — where and why?** | task, add, why |
+| `wait` | **A long command is starting — what, how long?** | task, cmd, eta_s |
+| `run` | **That command finished — how long, what exit?** | task, cmd, eta_s, actual_s, exit, late_s, over_s |
+| `end` | **What was done, what broke, how was it verified, what is left?** | status, summary, done, problems, verify, metrics, changes, commits, impact, next, lessons, refs, duration_s, notes, score, gate, forced |
 
 The `note` type is what makes a long task legible: an agent that works for an
 hour can record a problem at minute 10 instead of only reporting at the end.
@@ -83,22 +88,33 @@ hour can record a problem at minute 10 instead of only reporting at the end.
 ## Commands
 
 ```text
-relay [--session ID] [--agent NAME] [--model M] start "title"
+relay [--session ID] [--key KEY] [--agent NAME] [--model M] start "title"
       [--goal TEXT] [--plan TEXT]... [--accept TEXT]... [--out TEXT]...
       [--scope a,b]... [--tags a,b]... [--refs a,b]...
 
 relay [--session ID] note [TASK]
       --kind progress|problem|decision|result|blocker|question
-      --text TEXT [--detail TEXT]... [--refs a,b]...
+      --text "one line" [--next "one line"] [--detail TEXT]...
+      [--where a,b]... [--refs a,b]...
+
+relay [--session ID] scope [TASK] --add a,b... --why TEXT
+
+relay [--session ID] wait [TASK] --cmd CMD [--eta 8m]
+relay [--session ID] run [--task ID] --eta 8m -- CMD...
+relay [--session ID] run --record --cmd CMD --actual 95s [--eta 8m] [--exit N]
 
 relay [--session ID] end [TASK] --status done|partial|abandoned|blocked
       [--summary TEXT] [--done TEXT]... [--problem TEXT]... [--verify TEXT]...
       [--metric TEXT]... [--changes a,b]... [--commit sha]... [--next TEXT]...
-      [--lesson L-nn]... [--refs a,b]... [--impact TEXT]
+      [--lesson L-nn]... [--refs a,b]... [--impact TEXT] [--force]
 
 relay [--session ID] sync [--all] [--full] [--task ID]
 relay [--session ID] show [TASK] [--json]
+relay tick [--json] [--hook]     rhythm check: one line at most, exit 2 on violation
+relay board                      open tasks with now/next/scope-clash lines
 relay open [--stale]        list open tasks of every session (stale ones flagged)
+relay stats                      scoreboard over closed tasks
+relay guard --stop               Claude Code Stop hook: block once when silent too long
 relay migrate [--dry-run]
 relay doctor
 relay version
@@ -106,14 +122,20 @@ relay version
 
 - Without `--session`/`$RELAY_SESSION`, a session id is generated and printed
   (`session=…`); later commands must pass it back. `$RELAY_AGENT` and
-  `$RELAY_MODEL` are honoured.
-- `end`/`note` without a task id use the open task of the session; if the
-  session has none, the single open task of the same agent is used, otherwise
-  the command refuses and lists the candidates. `note` falls back to the most
-  recent task of the session, so a correction can still be attached after the
-  task was closed.
-- `show` prints one task in full (plan, notes, problems, verification, next).
-- Relay errors never block the main work (printed to stderr, exit 0).
+  `$RELAY_MODEL` are honoured. `--key`/`$RELAY_KEY` maps a harness session to a
+  relay session (written by hooks, so the agent never types an id).
+- `end`/`note`/`scope`/`wait`/`run` without a task id use the open task of the
+  session; if the session has none, the single open task of the same agent is
+  used, otherwise the command refuses and lists the candidates. `note` falls
+  back to the most recent task of the session, so a correction can still be
+  attached after the task was closed.
+- `run` without `--record` executes the command after `--`, writes `wait`
+  first and `run` after, and exits with the command's exit code.
+- `show` prints one task in full (plan, notes, scope changes, runs, problems,
+  verification, score). `stats` prints the scoreboard.
+- Relay errors never block the main work (printed to stderr, exit 0) — except
+  `end` gate violations (exit 1, event still recorded) and `tick` violations
+  (exit 2, nothing written).
 
 ## What to write in each field
 
@@ -159,6 +181,30 @@ your work depends on.
 `--summary/--verify`, print a one-line hint on stderr (never blocks). `relay
 doctor` and `relay open --stale` list tasks left open past `RELAY_STALE_HOURS`;
 close them with `relay end <task> --status abandoned|blocked`.
+
+## Rhythm, long commands, score (v4)
+
+- **Rhythm.** Log at least every `RELAY_GAP_MAX` seconds (default 600) of active
+  work. Time inside a declared `wait`/`run` window does not count.
+  `relay tick` checks: silence overdue, files outside the logged scope,
+  expired wait windows, unread news. It prints at most one line and exits 2 on
+  violation, else stays silent. `RELAY_NUDGE` (default 480) controls the soft
+  reminder threshold.
+- **Long commands.** Anything expected to take more than `RELAY_MIN_DECLARE`
+  (default 120s) gets `--eta`: `relay run --eta 8m -- <cmd>` (executes and
+  measures) or `relay wait --eta 8m --cmd "…"` + `relay run --record` (for
+  harnesses that time the tool call themselves). Tolerance is
+  `max(60s, 25%×eta)`; under- and over-estimating past tolerance both cost
+  score, and a run over 120s with no declared eta counts its excess as late.
+- **Scope.** `relay scope --add <path> --why "…"` extends the working scope.
+  `tick` compares `git status` against the effective scope; `end` diffs
+  `--changes` the same way. Drift costs scope points.
+- **Gate.** `end` always records the event but exits 1 when: silence past the
+  limit (wait excluded), late estimates, unlogged scope drift, or `done`
+  without `--verify`. `--force` records acceptance instead (`forced: true`).
+- **Score (0–100).** rhythm 50 · scope 20 · close 20 (summary/done/verify/next)
+  · open 10 (goal/plan/scope) · −10 when forced. Floored at 0. `relay stats`
+  and `relay doctor` print the board.
 
 ## Load silently, do not report
 

@@ -30,10 +30,12 @@ Only four paths are touched:
 
 | Path | Change |
 |---|---|
-| `.relay/` | Runtime: `relay` CLI (schema v3), `README.md`, `SNIPPET.md`; later `data/`, `cursors/`, `install.json` |
+| `.relay/` | Runtime: `relay` CLI (schema v4), `README.md`, `SNIPPET.md`; later `data/`, `cursors/`, `keys/`, `install.json` |
 | `.gitignore` | Adds `.relay/` (if missing) |
 | `AGENTS.md` | Inserts/replaces one `<!-- BEGIN relay-logs -->` … `<!-- END relay-logs -->` block |
 | `CLAUDE.md` | Inserts/replaces the same kind of block |
+| `.opencode/plugins/opencode-nudge.js` | Only with `--hooks`: timing + nudge plugin for OpenCode |
+| `.claude/settings.local.json` | Only with `--hooks`: merged `tick`/`guard` hook entries |
 
 The marker block is the whole uninstall contract: remove the block and the
 instructions are gone. Existing project content is never replaced wholesale.

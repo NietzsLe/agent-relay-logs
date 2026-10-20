@@ -29,9 +29,11 @@ Do this:
    older than the package, re-run the real install with --force.
 4. Run the same command without --dry-run (add --backup).
 5. Verify: /path/to/target/.relay/relay doctor, and one
-   start → note → end → show cycle (the runtime is schema v2: start carries
-   goal/plan/accept/scope, note records progress/problems while working, end
-   carries done/problems/verify/metrics/next/impact).
+   start → note → end → show cycle (the runtime is schema v4: start carries
+   goal/plan/accept/scope, note records progress with text/next while working,
+   scope logs working-scope changes, run records long commands with eta,
+   end carries done/problems/verify/metrics/next/impact plus gate and score).
+   With --hooks, also check the opencode plugin and the merged claude hooks.
 6. Show the git diff of AGENTS.md, CLAUDE.md and .gitignore. Do not commit
    unless I ask, and never commit .relay/.
 

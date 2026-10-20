@@ -21,10 +21,17 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = REPO_ROOT / "package"
 TEMPLATES = REPO_ROOT / "templates"
+HOOKS_SRC = REPO_ROOT / "scripts" / "hooks"
+OPENCODE_PLUGIN = "opencode-nudge.js"
+PLUGIN_DST = Path(".opencode/plugins") / OPENCODE_PLUGIN
+CLAUDE_SETTINGS = Path(".claude/settings.local.json")
+
+TICK_CMD = "[ -x .relay/relay ] && .relay/relay tick --hook 2>/dev/null | head -5 || true"
+GUARD_CMD = "[ -x .relay/relay ] && .relay/relay guard --stop 2>&1 | head -10 || true"
 
 BEGIN = "<!-- BEGIN relay-logs -->"
 END = "<!-- END relay-logs -->"
@@ -176,6 +183,203 @@ def runtime_version(path=None):
         return "?"
     match = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M)
     return match.group(1) if match else "?"
+
+
+# --------------------------------------------------------------------------- hooks
+def _hook_marker(text):
+    return "relay tick --hook" in text or "relay guard --stop" in text
+
+
+def _want_hook_entries():
+    tick = {"type": "command", "command": TICK_CMD}
+    guard = {"type": "command", "command": GUARD_CMD}
+    return {
+        "UserPromptSubmit": [{"hooks": [tick]}],
+        "PostToolUse": [{"matcher": "Bash|Edit|Write", "hooks": [tick]}],
+        "Stop": [{"hooks": [guard]}],
+    }
+
+
+def _strip_our_hooks(items):
+    """Remove our hook entries from a hook-type list. Return (kept, removed)."""
+    kept, removed = [], 0
+    for item in items or []:
+        if not isinstance(item, dict):
+            kept.append(item)
+            continue
+        hooks = item.get("hooks")
+        if not isinstance(hooks, list):
+            if _hook_marker(json.dumps(item)):
+                removed += 1
+                continue
+            kept.append(item)
+            continue
+        rest = [h for h in hooks if not _hook_marker(json.dumps(h))]
+        removed += len(hooks) - len(rest)
+        if rest:
+            item = dict(item)
+            item["hooks"] = rest
+            kept.append(item)
+        else:
+            removed += 0  # whole matcher entry dropped
+    return kept, removed
+
+
+def install_hooks(target, force, dry_run):
+    """Install the opencode plugin and merge Claude Code hooks. Idempotent."""
+    actions = []
+    src = HOOKS_SRC / OPENCODE_PLUGIN
+    if not src.is_file():
+        fail("missing hook source: %s" % src)
+    dst = target / PLUGIN_DST
+    if dst.exists():
+        try:
+            same = src.read_bytes() == dst.read_bytes()
+        except OSError:
+            same = False
+        if same:
+            actions.append("opencode plugin: unchanged")
+        elif not force:
+            actions.append("opencode plugin: kept existing (use --force to update)")
+        else:
+            if not dry_run:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            actions.append("opencode plugin: updated")
+    else:
+        if not dry_run:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        actions.append("opencode plugin: created")
+
+    settings = target / CLAUDE_SETTINGS
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    created = not settings.exists()
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        data["hooks"] = hooks
+    added = 0
+    for name, want in _want_hook_entries().items():
+        have = hooks.get(name)
+        if not isinstance(have, list):
+            have = []
+            hooks[name] = have
+        blob = json.dumps(have)
+        for entry in want:
+            if _hook_marker(json.dumps(entry)) and _hook_marker(blob):
+                continue
+            have.append(entry)
+            blob = json.dumps(have)
+            added += 1
+    if added or created:
+        if not dry_run:
+            settings.parent.mkdir(parents=True, exist_ok=True)
+            tmp = settings.with_name(settings.name + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp, settings)
+        actions.append("claude hooks: %s (%d added)" % ("created" if created else "merged", added))
+    else:
+        actions.append("claude hooks: unchanged")
+    return actions, created
+
+
+def remove_hooks(target, dry_run, delete_empty_settings=False):
+    """Remove what install_hooks added. Never touches user content."""
+    actions = []
+    src = HOOKS_SRC / OPENCODE_PLUGIN
+    dst = target / PLUGIN_DST
+    if not dst.exists():
+        actions.append("opencode plugin: absent")
+    else:
+        try:
+            ours = src.is_file() and src.read_bytes() == dst.read_bytes()
+        except OSError:
+            ours = False
+        if ours:
+            if not dry_run:
+                dst.unlink()
+                for parent in (dst.parent, dst.parent.parent):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+            actions.append("opencode plugin: removed")
+        else:
+            actions.append("opencode plugin: kept (modified by user)")
+
+    settings = target / CLAUDE_SETTINGS
+    try:
+        raw = settings.read_text(encoding="utf-8") if settings.exists() else ""
+        data = json.loads(raw) if raw else None
+    except (OSError, ValueError):
+        data = None
+    if not isinstance(data, dict) or not isinstance(data.get("hooks"), dict):
+        actions.append("claude hooks: absent")
+        return actions
+    hooks, removed_total = data["hooks"], 0
+    for name in list(hooks):
+        kept, removed = _strip_our_hooks(hooks.get(name))
+        removed_total += removed
+        if kept:
+            hooks[name] = kept
+        else:
+            del hooks[name]
+    if not hooks:
+        data.pop("hooks", None)
+    if removed_total:
+        if not dry_run:
+            if not data and delete_empty_settings:
+                settings.unlink()
+                try:
+                    settings.parent.rmdir()
+                except OSError:
+                    pass
+                actions.append("claude hooks: removed %d entr(y/ies), deleted empty file" % removed_total)
+            else:
+                if not data:
+                    data = {}
+                tmp = settings.with_name(settings.name + ".tmp")
+                with tmp.open("w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.write("\n")
+                os.replace(tmp, settings)
+                actions.append("claude hooks: removed %d entr(y/ies)" % removed_total)
+        else:
+            actions.append("claude hooks: would remove %d entr(y/ies)" % removed_total)
+    else:
+        actions.append("claude hooks: absent")
+    return actions
+
+
+def check_hooks(target):
+    """Return (ok, lines) describing hook state."""
+    lines, ok = [], True
+    dst = target / PLUGIN_DST
+    if dst.is_file():
+        lines.append("opencode plugin: present")
+    else:
+        lines.append("opencode plugin: absent")
+        ok = False
+    settings = target / CLAUDE_SETTINGS
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if isinstance(hooks, dict) and _hook_marker(json.dumps(hooks)):
+        lines.append("claude hooks: present")
+    else:
+        lines.append("claude hooks: absent")
+        ok = False
+    return ok, lines
 
 
 def install_package(target, force, dry_run):
@@ -336,6 +540,15 @@ def cmd_install(args):
         "created_files": sorted(set(manifest.get("created_files", [])) | set(created_files)),
     })
     manifest.setdefault("first_installed_at", now())
+
+    if args.hooks:
+        hook_actions, hooks_created = install_hooks(target, args.force, args.dry_run)
+        for action in hook_actions:
+            say("  hooks  %s" % action, args.quiet)
+        if not args.dry_run:
+            manifest["hooks"] = True
+            manifest["hooks_created_settings"] = bool(
+                manifest.get("hooks_created_settings") or hooks_created)
     save_manifest(target, manifest, args.dry_run)
     say("  manifest: %s" % ("would write" if args.dry_run else "written"), args.quiet)
 
@@ -379,6 +592,10 @@ def cmd_uninstall(args):
             if not args.dry_run:
                 path.unlink()
             say("  %s: deleted (created by installer)" % filename, args.quiet)
+
+    for action in remove_hooks(target, args.dry_run,
+                               delete_empty_settings=bool(manifest.get("hooks_created_settings"))):
+        say("  hooks  %s" % action, args.quiet)
 
     relay_dir = target / ".relay"
     if args.keep_relay:
@@ -456,6 +673,10 @@ def cmd_doctor(args):
         if proc.returncode:
             ok = False
 
+    hooks_ok, hook_lines = check_hooks(target)
+    for line in hook_lines:
+        print("%s" % line)
+
     print("result: %s" % ("OK" if ok else "PROBLEMS FOUND"))
     return 0 if ok else 1
 
@@ -477,6 +698,8 @@ def build_parser():
     install.add_argument("--skip-claude", action="store_true", help="do not touch CLAUDE.md")
     install.add_argument("--no-create", action="store_true", help="do not create a missing AGENTS.md/CLAUDE.md")
     install.add_argument("--no-gitignore", action="store_true", help="do not modify .gitignore")
+    install.add_argument("--hooks", action="store_true",
+                         help="install harness hooks (opencode plugin + Claude Code hooks)")
     install.add_argument("--quiet", action="store_true")
     install.set_defaults(func=cmd_install)
 

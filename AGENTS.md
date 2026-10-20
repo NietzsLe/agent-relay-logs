@@ -23,17 +23,27 @@ exactly what changed.
 ## The log contract (applies to any change of the runtime)
 
 - Every event type must carry the detail a reader needs:
-  `start` = goal/plan/accept/scope/tags · `note` = kind/text/detail ·
-  `end` = summary/done/problems/verify/metrics/changes/commits/next/lessons/impact.
+  `start` = goal/plan/accept/scope/tags · `note` = kind/text/next/detail/where/refs ·
+  `scope` = add/why · `wait/run` = cmd/eta/actual/exit/late/over ·
+  `end` = summary/done/problems/verify/metrics/changes/commits/next/lessons/impact/gate/score.
   A log of "task X started" is worth nothing to the next session.
 - **One file per day**: `data/YYYY-MM-DD.jsonl` holds every session's events of
-  that UTC day; cursors live in `cursors/<session>.json`. Appends must be
-  atomic (`O_APPEND` + a single `write()`), so concurrent sessions never
-  interleave a line.
+  that UTC day; cursors live in `cursors/<session>.json`, harness key mappings
+  in `keys/<key>.json`. Appends must be atomic (`O_APPEND` + a single `write()`),
+  so concurrent sessions never interleave a line.
+- **Rhythm is mechanical**: GAP_MAX/NUDGE/MIN_DECLARE envs, `tick` (exit 2 on
+  violation), scope drift via `git status`, `run` measures long commands with
+  two-sided tolerance, `end` gates (exit 1, event still recorded) and scores
+  (rhythm 50 / scope 20 / close 20 / open 10 / forced −10, floored at 0).
+  Never write guidance that exempts logging ("no need to log when…") — the
+  tool detects exemptions, the docs only state triggers.
 - One line must always be valid JSON. Oversized events are trimmed and flagged
   (`"trimmed": true`) — never cut mid-object.
-- Schema v1/v2 events must stay readable; new fields are optional and additive.
+- Schema v1/v2/v3 events must stay readable; new fields are optional and additive.
   Old per-session files are migrated into the day file, never deleted.
+- Hooks (`scripts/hooks/`, installed with `--hooks`) must never block the main
+  work: append-only, best-effort, no exceptions, uninstall removes exactly what
+  install added.
 - The agent name is inherited from the session's `join` event, so later commands
   do not have to repeat `--agent`.
 - List options are split on commas that are not inside brackets or quotes
@@ -105,7 +115,9 @@ longer used, delete everything between this marker and
   `package/README.md`.
 - Marker contract: `<!-- BEGIN relay-logs -->` / `<!-- END relay-logs -->`.
   The same markers are inserted into a target's `AGENTS.md` and `CLAUDE.md`.
-- The CLI is intentionally small: `start`, `end`, `sync`, `doctor`, `version`.
+- The CLI is intentionally small: `start`, `note`, `scope`, `wait`/`run`, `end`,
+  `sync`, `board`, `tick`, `stats`, `guard`, `show`, `open`, `migrate`,
+  `doctor`, `version`.
 - The log is local-only and only *relatively* complete. "Not in the log" does
   not mean "did not happen"; verify with git and the real project state.
 <!-- END relay-logs -->

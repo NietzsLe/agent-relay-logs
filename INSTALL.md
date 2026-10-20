@@ -16,7 +16,7 @@ replaces one marker block:
 
 | Path | Change |
 |---|---|
-| `.relay/relay` | CLI copied from `package/relay` (schema v3) |
+| `.relay/relay` | CLI copied from `package/relay` (schema v4) |
 | `.relay/README.md`, `.relay/SNIPPET.md` | Runtime docs |
 | `.relay/install.json` | Install manifest (local, git-ignored) |
 | `.relay/data/YYYY-MM-DD.jsonl` | The log: one file per day, all sessions |
@@ -68,6 +68,7 @@ Useful flags:
 |---|---|
 | `--backup` | Writes `AGENTS.md.relay-backup-<timestamp>` / `CLAUDE.md.relay-backup-<timestamp>` before editing |
 | `--force` | Updates existing `.relay/relay`, `README.md`, `SNIPPET.md` (never `data/`) — required to upgrade an older runtime |
+| `--hooks` | Install harness hooks: `.opencode/plugins/opencode-nudge.js` + merged `.claude/settings.local.json` entries (`tick`, `guard`) |
 | `--skip-agents` | Do not touch `AGENTS.md` |
 | `--skip-claude` | Do not touch `CLAUDE.md` |
 | `--no-create` | Do not create a missing `AGENTS.md` / `CLAUDE.md` |
@@ -79,7 +80,7 @@ adding a second one.
 **Upgrading an existing installation:** if the target already has `.relay/`, the
 runtime files are kept unless `--force` is given. The install output says which
 version is installed and which one the package provides, e.g.
-`relay: kept existing (v1.0.0; use --force to update to v3.0.0)`. Upgrade with:
+`relay: kept existing (v1.0.0; use --force to update to v4.0.0)`. Upgrade with:
 
 ```bash
 ./scripts/install.sh --target /path/to/project --force --backup
@@ -125,14 +126,16 @@ grep -nF '.relay/' "$TARGET/.gitignore"
 
 Expected:
 
-- `relay doctor` reports `relay 3.0.0 (schema 3)` and lists the day file.
+- `relay doctor` reports `relay 4.0.0 (schema 4)` and lists the day file.
 - `start` prints `task=…`; `note` prints `note=… task=…`; `end` prints
-  `ended=… status=done duration=… notes=1`.
+  `ended=… status=done duration=… notes=1 score=…`.
 - `show` prints the goal, the plan, the note and the verification.
 - Exactly **one** file in `.relay/data/` (named `YYYY-MM-DD.jsonl`) and one
   cursor in `.relay/cursors/`.
 - Each `grep -c` prints `1`.
 - `.gitignore` contains `.relay/`.
+- With `--hooks`: `.opencode/plugins/opencode-nudge.js` exists and
+  `.claude/settings.local.json` contains `relay tick --hook`.
 
 The verification events live in `.relay/data/verify-*`; they are local and
 git-ignored. You may leave them or delete only those specific session files.

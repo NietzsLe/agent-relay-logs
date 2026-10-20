@@ -14,6 +14,8 @@ a new process, so environment variables do not persist).
 The log is one file per day: `.relay/data/YYYY-MM-DD.jsonl` (every session of
 that day), cursors per session in `.relay/cursors/`.
 
+- **First: see what other sessions are doing right now:**
+  `.relay/relay board` — open tasks with now · next · scope-clash lines.
 - **Start of every real task** (after each user prompt that asks for work):
   ```bash
   .relay/relay --agent <name> start "<one-line title>" \
@@ -21,13 +23,16 @@ that day), cursors per session in `.relay/cursors/`.
     --scope <path,...> --tags <keyword,...> --accept "<how done is judged>"
   ```
   — syncs unread changes automatically before writing.
-- **While working** (important for long tasks — this is what makes the log
-  useful to another session):
+- **While working: one line per step, at least every 10 minutes.**
+  Time inside a declared `run` window does not count.
   ```bash
-  .relay/relay --session <id> note --kind progress|problem|decision|result|blocker \
-    --text "<what happened>" --detail "<raw output, numbers, error>"
+  .relay/relay --session <id> note --kind progress --text "<what just happened>" --next "<next step>"
   ```
-- **Right before the final response of the turn:**
+- **The working scope changed:**
+  `.relay/relay --session <id> scope --add <path,...> --why "<reason>"`
+- **A command that takes a while** (more than ~2 minutes):
+  `.relay/relay --session <id> run --eta 8m -- <command>`
+- **After each big step and right before the final response of the turn:**
   `.relay/relay --session <id> sync` — picks up work done by other agents while
   you were working.
 - **When done / abandoning / blocked:**
@@ -40,6 +45,10 @@ that day), cursors per session in `.relay/cursors/`.
     --changes <file,...> --commit <sha> --next "<open item>" --lesson L-nn \
     --impact "<what the next person must know>"
   ```
+  `end` exits 1 on gate violation (silence over the limit, badly estimated
+  commands, unlogged scope drift, `done` without `--verify`) — the event is
+  still recorded and the task is closed. Re-run the same `end` with `--force`
+  to accept the penalty.
 
 Rules:
 
