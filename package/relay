@@ -86,8 +86,10 @@ def rid():
 
 
 def git(*a):
+    # rstrip newlines only: porcelain's leading columns (e.g. " M file")
+    # are significant and must survive.
     try:
-        return subprocess.run(["git", *a], capture_output=True, text=True, timeout=5).stdout.strip()
+        return subprocess.run(["git", *a], capture_output=True, text=True, timeout=5).stdout.rstrip("\n")
     except Exception:
         return ""
 

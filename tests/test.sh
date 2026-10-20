@@ -335,6 +335,17 @@ echo "$OUT" | grep -q "tracked.txt:10" || fail "show did not print the note wher
 ./.relay/relay stats | grep -q "score TB" || fail "stats printed no scoreboard"
 pass "rhythm, scope, long commands, score, keys, guard"
 
+# --- porcelain's leading column must survive -------------------------------
+# regression: git()'s whole-output strip() ate the " M file" leading space,
+# so the first changed file parsed as "racked.txt" and tick cried drift
+rm -f outside.txt
+echo more >> tracked.txt
+./.relay/relay --agent tester4 --key "key2-$$" start "porcelain test" --scope tracked.txt >/dev/null
+./.relay/relay --key "key2-$$" tick >/dev/null \
+    || fail "tick flagged an in-scope change (porcelain parse bug)"
+./.relay/relay --key "key2-$$" end --status done --summary "ok" --verify "tick green" >/dev/null
+pass "porcelain leading column survives"
+
 # --- hooks install/uninstall -------------------------------------------------
 P7="$TMP/project7"
 mkdir -p "$P7"
