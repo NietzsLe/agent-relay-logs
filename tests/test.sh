@@ -94,6 +94,17 @@ OUT2=$(./.relay/relay --agent other --session "$SID2" sync)
 ./.relay/relay doctor >/dev/null
 pass "relay start/end/sync/doctor"
 
+# --- v3.1: quality nudges and `open` ---------------------------------------
+SID3="test3-$$"
+ERR=$(./.relay/relay --agent tester --session "$SID3" start "thin task" 2>&1 >/dev/null)
+echo "$ERR" | grep -q -- "--plan" || fail "thin start gave no nudge"
+./.relay/relay open | grep -q "thin task" || fail "open did not list the open task"
+ERR=$(./.relay/relay --agent tester --session "$SID3" end --status done 2>&1 >/dev/null)
+echo "$ERR" | grep -q -- "--verify" || fail "thin end gave no nudge"
+./.relay/relay open | grep -q "thin task" && fail "open still lists a closed task"
+./.relay/relay open --stale | grep -q "no stale" || fail "open --stale should be empty"
+pass "quality nudges and open"
+
 # --- schema v3: detail in every event type ---------------------------------
 P4="$TMP/project4"
 mkdir -p "$P4"

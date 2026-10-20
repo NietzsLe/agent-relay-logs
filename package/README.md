@@ -12,7 +12,6 @@ they understand the environment without asking the user again.
 ├── relay              the CLI
 ├── README.md          this file
 ├── SNIPPET.md         short usage snippet
-├── install.json       install manifest (local)
 ├── data/
 │   ├── 2026-10-19.jsonl   every event of that UTC day — all sessions, one file
 │   ├── 2026-10-20.jsonl
@@ -99,6 +98,7 @@ relay [--session ID] end [TASK] --status done|partial|abandoned|blocked
 
 relay [--session ID] sync [--all] [--full] [--task ID]
 relay [--session ID] show [TASK] [--json]
+relay open [--stale]        list open tasks of every session (stale ones flagged)
 relay migrate [--dry-run]
 relay doctor
 relay version
@@ -152,6 +152,13 @@ manual SQL, another machine). **"Not in the log" does not mean "did not happen";
 "no open work" does not mean "nobody is working."** The source of truth is the
 real state (`git log/status`, files, database) — verify anything in the log that
 your work depends on.
+
+## Quality nudges (v3.1)
+
+`start` without `--plan/--accept/--scope`, and `end --status done` without
+`--summary/--verify`, print a one-line hint on stderr (never blocks). `relay
+doctor` and `relay open --stale` list tasks left open past `RELAY_STALE_HOURS`;
+close them with `relay end <task> --status abandoned|blocked`.
 
 ## Load silently, do not report
 

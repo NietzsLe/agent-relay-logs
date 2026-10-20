@@ -29,7 +29,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 SCHEMA = 3
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
@@ -519,6 +519,42 @@ def sync(sid, all_=False, first=False, full=False, only=None):
     print("\n".join(lines))
 
 
+def warn_quality(typ, fields):
+    """Non-blocking nudges on stderr: a thin log is the main way relay loses value."""
+    wanted = {
+        "start": (("plan", "--plan"), ("accept", "--accept"), ("scope", "--scope")),
+        "end": (("summary", "--summary"), ("verify", "--verify")),
+    }.get(typ, ())
+    missing = [flag for key, flag in wanted if not fields.get(key)]
+    if missing:
+        print("[relay] thin %s event, add: %s (next session reads this)" % (typ, " ".join(missing)),
+              file=sys.stderr)
+
+
+def open_report(stale_only=False):
+    """Print every open task across all sessions, oldest first, stale ones flagged."""
+    rows = []
+    for fn in data_files():
+        evs, _ = read_file(fn)
+        rows += open_tasks(evs)
+    # a task may span days: drop tasks closed in a later day file
+    closed = {e.get("task") for e in all_events() if e.get("type") == "end"}
+    rows = [t for t in rows if t["id"] not in closed]
+    rows.sort(key=lambda e: e.get("ts", ""))
+    shown = 0
+    for t in rows:
+        age = age_h(t["ts"])
+        stale = age > STALE_H
+        if stale_only and not stale:
+            continue
+        shown += 1
+        print("%s %s [%s] %s  (%.1fh%s)" % ("?" if stale else "▶", t["id"], who(t),
+                                           t.get("title", ""), age,
+                                           ", possibly abandoned" if stale else ""))
+    if not shown:
+        print("no %sopen tasks" % ("stale " if stale_only else ""))
+
+
 # --------------------------------------------------------------------------- show
 def find_task(task_id):
     """Return (start_event, [notes], end_event) for a task id, searching every session."""
@@ -606,6 +642,16 @@ def doctor():
     except OSError:
         cursors = []
     print("cursors: %d" % len(cursors))
+    closed = {e.get("task") for e in all_events() if e.get("type") == "end"}
+    stale = [t for fn in data_files() for t in open_tasks(read_file(fn)[0])
+             if t["id"] not in closed and age_h(t["ts"]) > STALE_H]
+    for t in stale:
+        print("  stale open task %s [%s] %s (%.0fh) — close it: relay end %s --status abandoned|blocked"
+              % (t["id"], who(t), t.get("title", ""), age_h(t["ts"]), t["id"]))
+    thin = [e for e in all_events() if e.get("type") == "end" and not e.get("verify")
+            and e.get("status") == "done"]
+    if thin:
+        print("  %d 'done' task(s) closed without --verify" % len(thin))
     legacy = legacy_files()
     if legacy:
         print("legacy per-session files: %s (run 'relay migrate' to fold them into the day files)"
@@ -670,6 +716,8 @@ def build_parser():
     mg = sub.add_parser("migrate", help="fold legacy per-session files into the day files")
     mg.add_argument("--dry-run", action="store_true", help="show what would move, write nothing")
 
+    op = sub.add_parser("open", help="list open tasks of every session (stale ones flagged)")
+    op.add_argument("--stale", action="store_true", help="only tasks older than RELAY_STALE_HOURS")
     sub.add_parser("doctor", help="health check")
     sub.add_parser("version", help="print the version")
     return p
@@ -724,6 +772,9 @@ def main():
     if args.cmd == "doctor":
         doctor()
         return
+    if args.cmd == "open":
+        open_report(args.stale)
+        return
     if args.cmd == "migrate":
         report = migrate(args.dry_run)
         for line in report:
@@ -774,6 +825,7 @@ def main():
         clash = [t for t in open_tasks([e for e in all_events() if e.get("session") != sid])
                  if overlap(scope, t.get("scope", []))]
         append(sid, ev)
+        warn_quality("start", ev)
         print("task=%s" % ev["id"])
         for t in clash:
             print("! scope overlaps open work [%s] %s: %s" % (who(t), t["id"], t.get("title", "")))
@@ -824,6 +876,8 @@ def main():
             "notes": len(notes),
         })
         append(sid, ev)
+        if ev["status"] == "done":
+            warn_quality("end", ev)
         print("ended=%s status=%s duration=%s notes=%d"
               % (task, ev["status"], fmt_duration(duration), len(notes)))
         sync(sid)
