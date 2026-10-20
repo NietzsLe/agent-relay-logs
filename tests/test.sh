@@ -105,6 +105,13 @@ fi
 grep -q "GATE" "$TMP/gate.err" || fail "gate gave no GATE message"
 ./.relay/relay --session "$SID3" end --status done --summary "s" --verify "ok" --force >/dev/null
 events_of "$SID3" | grep -q '"forced": true' || fail "--force did not record forced=true"
+events_of "$SID3" | python3 -c 'import json,sys
+ends = [json.loads(l) for l in sys.stdin if json.loads(l)["type"] == "end"]
+last = ends[-1]
+assert last.get("forced") is True, "not forced"
+assert last.get("gate"), "re-close lost the original gate"
+assert last.get("verify") == ["ok"], "re-close lost the new verify"
+' || fail "--force re-close did not preserve gate/detail"
 ./.relay/relay open | grep -q "thin task" && fail "open still lists a closed task"
 ./.relay/relay open --stale | grep -q "no stale" || fail "open --stale should be empty"
 pass "quality nudges, open, and end gate"

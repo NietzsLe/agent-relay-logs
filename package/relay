@@ -1577,7 +1577,7 @@ def main():
         if not task:
             print("[relay] không có việc đang dở để kết thúc", file=sys.stderr)
             return
-        start, notes, _end, _ex = find_task(task)
+        start, notes, prev_end, _ex = find_task(task)
         duration = 0
         if start:
             try:
@@ -1587,9 +1587,14 @@ def main():
                 duration = 0
         changes = clip_list(flat(args.changes), *LIST_LIMITS["changes"])
         verify = clip_list(args.verify, *LIST_LIMITS["verify"])
+        if reclose and prev_end:
+            if not changes:
+                changes = prev_end.get("changes") or []
         gate, _tm, drift = end_gate(task, start, changes, args.status)
-        if args.status == "done" and not verify:
+        if args.status == "done" and not verify and not (reclose and prev_end and prev_end.get("verify")):
             gate.append("done nhưng thiếu --verify")
+        if reclose and not gate and prev_end and prev_end.get("gate"):
+            gate = prev_end["gate"]  # accepting the original violation
         forced = bool(args.force and (gate or reclose))
         ev = base(sid, args, "end")
         ev.update({
@@ -1611,6 +1616,12 @@ def main():
             "gate": gate,
             "forced": forced,
         })
+        if reclose and prev_end:
+            # accepting must not wipe the detail already recorded
+            for k in ("summary", "done", "problems", "verify", "metrics", "changes",
+                      "commits", "impact", "next", "lessons", "refs"):
+                if not ev.get(k) and prev_end.get(k):
+                    ev[k] = prev_end[k]
         sc = task_score(task, start, ev, changes, forced)
         ev.update({"score": sc["score"], "cadence": sc["cadence"], "scope_pts": sc["scope"],
                    "close_pts": sc["close"], "open_pts": sc["open"],
