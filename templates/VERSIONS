@@ -4,5 +4,5 @@
 # reports vOld -> vNew, and `doctor` flags outdated installs.
 # v1 = any installed block without a stamp line (all installs before this file
 # existed). Templates below are stamped `<!-- relay-logs <name> vN -->`.
-agents-block.md v2
-claude-block.md v2
+agents-block.md v3
+claude-block.md v3

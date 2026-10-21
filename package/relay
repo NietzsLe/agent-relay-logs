@@ -39,8 +39,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 SCHEMA = 4
+# Block template version this runtime understands. board/doctor compare the
+# stamp inside AGENTS.md/CLAUDE.md marker blocks against it; templates carry
+# the same number (see templates/VERSIONS). A test pins all three in sync.
+BLOCK_VERSION = 3
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 CURSORS = os.path.join(ROOT, "cursors")
@@ -919,6 +923,55 @@ def task_now_next(task_id):
     return now_txt, next_txt or "—"
 
 
+BLOCK_STAMP_RE = re.compile(r"relay-logs\s+(\S+)\s+v(\d+)")
+BLOCK_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def installed_block_version(text):
+    """Version stamp inside an installed marker block, None when absent/legacy."""
+    match = BLOCK_STAMP_RE.search(text or "")
+    return int(match.group(2)) if match else None
+
+
+def block_status_lines():
+    """One-line relay-block health per doc file, for board() and doctor().
+
+    Reads only AGENTS.md/CLAUDE.md next to .relay — no installer needed.
+    Missing .relay context is not our case: these run inside an installed target.
+    """
+    repo = os.path.dirname(ROOT)
+    out = []
+    for name in BLOCK_FILES:
+        path = os.path.join(repo, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            out.append((name, None, "absent"))
+            continue
+        begins = text.count("<!-- BEGIN relay-logs -->")
+        if begins == 0:
+            out.append((name, None, "no block"))
+            continue
+        out.append((name, installed_block_version(text), "ok"))
+    return out
+
+
+def format_block_status():
+    """Compact board line; empty string when everything is current."""
+    missing = [n for n, v, s in block_status_lines() if s != "ok" or v is None]
+    outdated = [(n, v) for n, v, s in block_status_lines()
+                if s == "ok" and v is not None and v != BLOCK_VERSION]
+    if not missing and not outdated:
+        return "blocks: v%d OK" % BLOCK_VERSION
+    parts = []
+    if missing:
+        parts.append("missing block in %s" % ", ".join(missing))
+    for name, ver in outdated:
+        parts.append("%s v%s outdated (runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
+    return "blocks: " + "; ".join(parts)
+
+
 def board_lines(sid=None, limit=10, only_others=False):
     """One line per open task: now · next · scope clash. For board and sync."""
     mine_scope = []
@@ -956,10 +1009,11 @@ def board(sid=None):
     lines = board_lines(sid)
     if not lines:
         print("không có task nào đang mở")
-        return
-    print("board — %d task đang mở:" % len(lines))
-    for ln in lines:
-        print("  " + ln)
+    else:
+        print("board — %d task đang mở:" % len(lines))
+        for ln in lines:
+            print("  " + ln)
+    print(format_block_status())
 
 
 def peek_unread(sid):
@@ -1209,6 +1263,24 @@ def doctor():
         print("data writable: no (%s)" % ex)
     print("python: %s" % platform.python_version())
     print("git: %s" % (git("--version") or "not found (optional)"))
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = os.path.join(os.path.dirname(ROOT), name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            print("%s: no block (relay not installed here)" % name)
+            continue
+        if "<!-- BEGIN relay-logs -->" not in text:
+            print("%s: no block (relay not installed here)" % name)
+            continue
+        ver = installed_block_version(text)
+        if ver is None:
+            print("%s: block unversioned (legacy — rerun installer to upgrade)" % name)
+        elif ver == BLOCK_VERSION:
+            print("%s: block v%d (up to date)" % (name, ver))
+        else:
+            print("%s: block v%d OUTDATED (runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
     for fn in data_files():
         evs, _ = read_file(fn)
         kinds = {}

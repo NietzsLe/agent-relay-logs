@@ -90,8 +90,8 @@ Marker blocks (`AGENTS.md`, `CLAUDE.md`) are always refreshed to the current
 templates — no flag needed. Each block carries a version stamp
 (`<!-- relay-logs <name> vN -->`; blocks installed before versioning have none
 and count as v1). The installer reports what changed, e.g.
-`AGENTS.md: updated (unversioned -> v2)`, and skips the write when the block
-is already identical (`unchanged (already v2)`). `doctor` shows the installed
+`AGENTS.md: updated (unversioned -> v3)`, and skips the write when the block
+is already identical (`unchanged (already v3)`). `doctor` shows the installed
 block version and flags outdated blocks; `.relay/install.json` records
 `block_versions`. To check without writing:
 
@@ -100,7 +100,11 @@ block version and flags outdated blocks; `.relay/install.json` records
 python3 scripts/relay_setup.py doctor --target /path/to/project
 ```
 
-`.relay/data` (the existing log) is never touched by an upgrade. The new
+`.relay/data` (the existing log) is never touched by an upgrade. Agents
+self-check at session start: every `board` prints block status (`blocks: vN OK`
+or names outdated/missing files), and the installed blocks instruct the agent
+to fetch this repo and (re)install when `.relay/` is absent (fresh clone) or
+blocks are outdated — no manual version tracking needed. The new
 runtime migrates an old per-session layout on the first command: the events are
 folded into `data/YYYY-MM-DD.jsonl` and the original file is moved to
 `data/legacy/` (nothing is deleted). To see it first:

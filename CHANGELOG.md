@@ -1,6 +1,6 @@
 # Changelog
 
-## v4.1.0 — browser delegation awareness + versioned marker blocks
+## v4.1.0 — browser delegation, versioned blocks, self-healing setup
 
 - Agent guidance: tasks needing a real browser are delegated by default to the
   `claude` CLI (`claude --chrome --model sonnet -p "..."`); no local Chrome
@@ -14,6 +14,12 @@
   identical); `doctor` shows installed block versions and flags outdated ones;
   `install.json` records `block_versions`. Legacy blocks without a stamp count
   as unversioned and are upgraded on the next install.
+- Self-healing setup: the runtime knows `BLOCK_VERSION` and every `board`
+  prints block status (`blocks: vN OK` or names outdated/missing files);
+  `relay doctor` reports the same. Installed blocks instruct the agent to
+  fetch the installer repo and (re)install when `.relay/` is absent or blocks
+  are outdated — a fresh clone becomes compatible inside the session, no
+  manual version tracking.
 
 ## v4.0.0 — rhythm enforcement, scope tracking, scoreboard, hooks
 

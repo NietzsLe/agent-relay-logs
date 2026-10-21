@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs agents-block v2 -->
+<!-- relay-logs agents-block v3 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The system is local-only and
@@ -49,8 +49,7 @@ and humans must be able to read your work without asking you.
   --impact "<what the next person must know>"
 ```
 
-**Rhythm (checked by the tool, not by memory):**
-- `relay tick` prints at most one line when something needs you: silence past
+**Rhythm (checked by the tool, not by memory):**- `relay tick` prints at most one line when something needs you: silence past
   the reminder, files outside the logged scope, or unread news from other
   sessions. Silence means everything is fine.
 - Log at least every 10 minutes of active work. Time inside a declared
@@ -85,6 +84,16 @@ If delegation is unavailable in this environment (no `claude` CLI, no
 `--chrome` support, or the required sign-in is missing): do NOT silently skip —
 tell the user exactly what is missing (which tool, which flag, which login) so
 it can be installed.
+
+**Session start: make sure the relay itself is compatible (do this yourself):**
+- If `.relay/` does not exist here (fresh clone — `.relay` is git-ignored and
+  never travels with the repo): fetch the installer repo
+  (`git@github.com:NietzsLe/agent-relay-logs.git`, shallow clone is enough) and
+  run its `install.sh --target .` before starting real work. If you have no
+  network access to it, say so instead of working without a log.
+- Run `.relay/relay board` first anyway: if it reports your blocks OUTDATED
+  (installed vX, runtime wants vY), rerun the installer to upgrade, then
+  continue. Never work a whole session on a stale setup in silence.
 
 Rules:
 

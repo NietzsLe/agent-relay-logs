@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs claude-block v2 -->
+<!-- relay-logs claude-block v3 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The full rules live in the
@@ -22,6 +22,10 @@ absent).
   Static page reads are not this (use `webfetch`). Verify results yourself; never
   paste secrets into the prompt. If `claude --chrome` is unavailable, say exactly
   what is missing instead of skipping.
+- Session start: if no `.relay/` here (fresh clone — it is git-ignored), fetch
+  the installer repo and run `install.sh --target .` first; if `board` says your
+  blocks are OUTDATED, rerun the installer to upgrade. Never work on a stale
+  setup in silence.
 - Detail matters: goal/plan/accept on start, text+next on notes, done/problems/
   verify/metrics/next on end. The log is one file per day
   (`.relay/data/YYYY-MM-DD.jsonl`), cursors in `.relay/cursors/`. Local-only,

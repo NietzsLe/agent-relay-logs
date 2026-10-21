@@ -421,10 +421,10 @@ P8="$TMP/project8"
 mkdir -p "$P8"
 "$ROOT/scripts/install.sh" --target "$P8" >/dev/null
 contains "claude --chrome" "$P8/AGENTS.md"
-contains "relay-logs agents-block v2" "$P8/AGENTS.md"
+contains "relay-logs agents-block v3" "$P8/AGENTS.md"
 contains "claude --chrome" "$P8/CLAUDE.md"
-contains "relay-logs claude-block v2" "$P8/CLAUDE.md"
-python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==2, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==2" \
+contains "relay-logs claude-block v3" "$P8/CLAUDE.md"
+python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==3, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==3" \
     || fail "manifest has no block_versions"
 pass "fresh installs teach browser delegation and stamp block versions"
 
@@ -433,22 +433,71 @@ P9="$TMP/project9"
 mkdir -p "$P9"
 printf '# AGENTS.md\n\nKeep this line.\n\n<!-- BEGIN relay-logs -->\n## Relay — old text\n<!-- END relay-logs -->\n' > "$P9/AGENTS.md"
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "unversioned -> v2" || fail "upgrade did not report unversioned -> v2: $OUT"
+echo "$OUT" | grep -q "unversioned -> v3" || fail "upgrade did not report unversioned -> v3: $OUT"
 contains "claude --chrome" "$P9/AGENTS.md"
-contains "relay-logs agents-block v2" "$P9/AGENTS.md"
+contains "relay-logs agents-block v3" "$P9/AGENTS.md"
 contains "Keep this line." "$P9/AGENTS.md"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "upgrade duplicated the block"
 pass "legacy blocks upgrade to the versioned template, user text kept"
 
 # --- v4.1: doctor flags outdated blocks, reinstall is a no-op when current -
-sed -i 's/relay-logs agents-block v2/relay-logs agents-block v1/' "$P9/AGENTS.md"
+sed -i 's/relay-logs agents-block v3/relay-logs agents-block v1/' "$P9/AGENTS.md"
 OUT=$("$ROOT/scripts/relay_setup.py" doctor --target "$P9" 2>&1)
 echo "$OUT" | grep -q "outdated" || fail "doctor did not flag the outdated block"
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "v1 -> v2" || fail "reinstall did not report v1 -> v2: $OUT"
+echo "$OUT" | grep -q "v1 -> v3" || fail "reinstall did not report v1 -> v3: $OUT"
 OUT2=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT2" | grep -q "unchanged (already v2)" || fail "second install is not a no-op: $OUT2"
+echo "$OUT2" | grep -q "unchanged (already v3)" || fail "second install is not a no-op: $OUT2"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "reinstall duplicated the block"
 pass "doctor flags outdated blocks; reinstall upgrades once, then is a no-op"
+
+# --- v4.1: version constants stay in sync across runtime/templates/registry --
+python3 - "$ROOT" <<'EOF'
+import re, sys
+root = sys.argv[1]
+relay = open(root + "/package/relay", encoding="utf-8").read()
+setup = open(root + "/scripts/relay_setup.py", encoding="utf-8").read()
+tmpl = {}
+for name in ("agents-block.md", "claude-block.md"):
+    text = open(root + "/templates/" + name, encoding="utf-8").read()
+    m = re.search(r"relay-logs\s+\S+\s+v(\d+)", text)
+    assert m, "template %s has no version stamp" % name
+    tmpl[name] = int(m.group(1))
+reg = {}
+for line in open(root + "/templates/VERSIONS", encoding="utf-8"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    fname, ver = line.split()
+    reg[fname] = int(ver.lstrip("v"))
+m1 = re.search(r"^BLOCK_VERSION\s*=\s*(\d+)", relay, re.M)
+assert m1, "relay has no BLOCK_VERSION"
+rbv = int(m1.group(1))
+assert set(tmpl) == set(reg), "VERSIONS registry does not cover all templates"
+assert all(v == rbv for v in tmpl.values()), "template stamps disagree: %r" % tmpl
+assert all(v == rbv for v in reg.values()), "registry disagrees: %r" % reg
+print("runtime BLOCK_VERSION=%d templates=%r registry=%r" % (rbv, tmpl, reg))
+EOF
+pass "runtime, templates, and registry agree on the block version"
+
+# --- board reports block status; outdated blocks are flagged in-session ----
+P10="$TMP/project10"
+mkdir -p "$P10"
+"$ROOT/scripts/install.sh" --target "$P10" >/dev/null
+cd "$P10"
+git init -q . 2>/dev/null || true
+OUT=$(./.relay/relay --agent probe --session "probe-$$" board 2>&1)
+echo "$OUT" | grep -q "blocks: v3 OK" || fail "board did not report current blocks: $OUT"
+sed -i 's/relay-logs agents-block v3/relay-logs agents-block v1/' AGENTS.md
+OUT2=$(./.relay/relay --agent probe --session "probe2-$$" board 2>&1)
+echo "$OUT2" | grep -qi "outdated" || fail "board did not flag the outdated block: $OUT2"
+echo "$OUT2" | grep -q "AGENTS.md" || fail "board did not name the outdated file: $OUT2"
+OUT3=$(./.relay/relay doctor 2>&1)
+echo "$OUT3" | grep -q "OUTDATED" || fail "doctor did not flag the outdated block"
+echo "$OUT3" | grep -q "up to date" || fail "doctor did not confirm the current block"
+"$ROOT/scripts/install.sh" --target "$P10" >/dev/null
+OUT4=$(./.relay/relay --agent probe --session "probe3-$$" board 2>&1)
+echo "$OUT4" | grep -q "blocks: v3 OK" || fail "board not green after upgrade: $OUT4"
+pass "board and doctor flag outdated blocks; upgrade closes the loop"
 
 echo "all tests passed"
