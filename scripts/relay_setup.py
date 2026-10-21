@@ -21,7 +21,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = REPO_ROOT / "package"
 TEMPLATES = REPO_ROOT / "templates"
@@ -36,6 +36,7 @@ GUARD_CMD = "[ -x .relay/relay ] && .relay/relay guard --stop 2>&1 | head -10 ||
 BEGIN = "<!-- BEGIN relay-logs -->"
 END = "<!-- END relay-logs -->"
 BLOCK_RE = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END), re.S)
+BLOCK_STAMP_RE = re.compile(r"relay-logs\s+(\S+)\s+v(\d+)")
 MANIFEST_NAME = "install.json"
 RUNTIME_FILES = ("relay", "README.md", "SNIPPET.md")
 GITIGNORE_ENTRIES = {".relay", ".relay/"}
@@ -118,6 +119,27 @@ def write_text(path, text, crlf=False, bom=False, backup=False):
         raise
 
 
+def template_block_version(name):
+    """Version stamp of a template (templates/VERSIONS documents the scheme)."""
+    path = TEMPLATES / name
+    if not path.is_file():
+        fail("missing template: %s" % path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as ex:
+        fail("cannot read template %s: %s" % (path, ex))
+    match = BLOCK_STAMP_RE.search(text)
+    if not match:
+        fail("template %s has no version stamp (expected '<!-- relay-logs <name> vN -->')" % name)
+    return int(match.group(2))
+
+
+def installed_block_version(text):
+    """Version stamp found in an installed block, or None for legacy blocks."""
+    match = BLOCK_STAMP_RE.search(text)
+    return int(match.group(2)) if match else None
+
+
 def template_block(name):
     path = TEMPLATES / name
     if not path.is_file():
@@ -126,34 +148,52 @@ def template_block(name):
     return text.strip() + "\n"
 
 
-def upsert_block(path, block, dry_run, backup, header):
-    """Insert one marker block, or replace existing blocks in place."""
+def upsert_block(path, block, dry_run, backup, header, template_version=None):
+    """Insert one marker block, or replace existing blocks in place.
+
+    Everything between the markers is installer-owned, so an upgrade replaces
+    the whole block. Reports vOld -> vNew; skips the write when the installed
+    block is already identical (idempotent, no mtime churn).
+    """
+    new_block = block.strip()
     if path.exists():
         text, crlf, bom = read_text(path)
         begins, ends = text.count(BEGIN), text.count(END)
         if begins != ends:
             fail("%s has unbalanced relay markers (%d BEGIN, %d END); fix it manually" % (path, begins, ends))
         if begins:
-            state = {"first": True}
+            old_v = installed_block_version(text)
+            old_label = ("v%d" % old_v) if old_v is not None else "unversioned"
+            new_label = ("v%d" % template_version) if template_version is not None else "template"
+            state = {"first": True, "identical": True}
 
-            def repl(_match):
+            def repl(match):
                 if state["first"]:
                     state["first"] = False
-                    return block.strip()
+                    if match.group(0).strip() != new_block:
+                        state["identical"] = False
+                    return new_block
+                state["identical"] = False
                 return ""
 
             new, count = BLOCK_RE.subn(repl, text)
-            action = "updated" if count == 1 else "updated (removed %d duplicate block(s))" % (count - 1)
+            if state["identical"] and count == 1:
+                return "unchanged (already %s)" % new_label
+            if not dry_run:
+                write_text(path, new, crlf, bom, backup)
+            if count == 1:
+                return "updated (%s -> %s)" % (old_label, new_label)
+            return "updated (%s -> %s; removed %d duplicate block(s))" % (old_label, new_label, count - 1)
         else:
             base = text.rstrip()
-            new = (base + "\n\n" if base else "") + block.strip() + "\n"
+            new = (base + "\n\n" if base else "") + new_block + "\n"
             action = "added"
         if not dry_run:
             write_text(path, new, crlf, bom, backup)
         return action
 
     if not dry_run:
-        write_text(path, header + "\n\n" + block.strip() + "\n", backup=backup)
+        write_text(path, header + "\n\n" + new_block + "\n", backup=backup)
     return "created"
 
 
@@ -507,6 +547,7 @@ def cmd_install(args):
     manifest = load_manifest(target)
     blocks = []
     created_files = []
+    block_versions = dict(manifest.get("block_versions", {}))
     for filename, template, _flag, _dest in TARGET_FILES:
         skip = (filename == "AGENTS.md" and args.skip_agents) or (filename == "CLAUDE.md" and args.skip_claude)
         if skip:
@@ -517,15 +558,19 @@ def cmd_install(args):
         if not existed and args.no_create:
             say("  %s: missing (skipped; --no-create)" % filename, args.quiet)
             continue
+        tver = template_block_version(template)
         action = upsert_block(
             path,
             template_block(template),
             args.dry_run,
             args.backup,
             "# " + filename,
+            template_version=tver,
         )
         say("  %s: %s" % (filename, action), args.quiet)
         blocks.append(filename)
+        if not args.dry_run:
+            block_versions[filename] = tver
         if not existed:
             created_files.append(filename)
 
@@ -538,6 +583,7 @@ def cmd_install(args):
         "gitignore_created": bool(manifest.get("gitignore_created") or gi_created),
         "files": sorted(set(manifest.get("files", [])) | set(blocks)),
         "created_files": sorted(set(manifest.get("created_files", [])) | set(created_files)),
+        "block_versions": block_versions,
     })
     manifest.setdefault("first_installed_at", now())
 
@@ -639,7 +685,7 @@ def cmd_doctor(args):
         print("relay: MISSING")
         ok = False
 
-    for filename in ("AGENTS.md", "CLAUDE.md"):
+    for filename, template, _flag, _dest in TARGET_FILES:
         path = target / filename
         if not path.exists():
             print("%s: absent" % filename)
@@ -650,6 +696,17 @@ def cmd_doctor(args):
         print("%s: %d BEGIN / %d END (%s)" % (filename, begins, ends, status))
         if begins != ends or begins > 1:
             ok = False
+            continue
+        try:
+            want = template_block_version(template)
+        except SetupError:
+            want = None
+        have = installed_block_version(text)
+        have_label = ("v%d" % have) if have is not None else "unversioned"
+        if want is not None and have != want:
+            print("%s: block %s installed, template is v%d (outdated — rerun install to upgrade)" % (filename, have_label, want))
+        elif want is not None:
+            print("%s: block v%d (up to date)" % (filename, want))
 
     gitignore = target / ".gitignore"
     if gitignore.exists():

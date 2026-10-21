@@ -416,4 +416,39 @@ if "$ROOT/scripts/install.sh" --target "$P3" >/dev/null 2>&1; then
 fi
 pass "install refuses to edit unbalanced markers"
 
+# --- v4.1: browser delegation guidance in fresh installs -------------------
+P8="$TMP/project8"
+mkdir -p "$P8"
+"$ROOT/scripts/install.sh" --target "$P8" >/dev/null
+contains "claude --chrome" "$P8/AGENTS.md"
+contains "relay-logs agents-block v2" "$P8/AGENTS.md"
+contains "claude --chrome" "$P8/CLAUDE.md"
+contains "relay-logs claude-block v2" "$P8/CLAUDE.md"
+python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==2, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==2" \
+    || fail "manifest has no block_versions"
+pass "fresh installs teach browser delegation and stamp block versions"
+
+# --- v4.1: legacy (unstamped) blocks upgrade in place ----------------------
+P9="$TMP/project9"
+mkdir -p "$P9"
+printf '# AGENTS.md\n\nKeep this line.\n\n<!-- BEGIN relay-logs -->\n## Relay — old text\n<!-- END relay-logs -->\n' > "$P9/AGENTS.md"
+OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
+echo "$OUT" | grep -q "unversioned -> v2" || fail "upgrade did not report unversioned -> v2: $OUT"
+contains "claude --chrome" "$P9/AGENTS.md"
+contains "relay-logs agents-block v2" "$P9/AGENTS.md"
+contains "Keep this line." "$P9/AGENTS.md"
+[ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "upgrade duplicated the block"
+pass "legacy blocks upgrade to the versioned template, user text kept"
+
+# --- v4.1: doctor flags outdated blocks, reinstall is a no-op when current -
+sed -i 's/relay-logs agents-block v2/relay-logs agents-block v1/' "$P9/AGENTS.md"
+OUT=$("$ROOT/scripts/relay_setup.py" doctor --target "$P9" 2>&1)
+echo "$OUT" | grep -q "outdated" || fail "doctor did not flag the outdated block"
+OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
+echo "$OUT" | grep -q "v1 -> v2" || fail "reinstall did not report v1 -> v2: $OUT"
+OUT2=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
+echo "$OUT2" | grep -q "unchanged (already v2)" || fail "second install is not a no-op: $OUT2"
+[ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "reinstall duplicated the block"
+pass "doctor flags outdated blocks; reinstall upgrades once, then is a no-op"
+
 echo "all tests passed"

@@ -1,0 +1,8 @@
+# Block template versions. Bump a block's version whenever its template content
+# changes in a way installed targets should pick up. The installer replaces the
+# whole block on upgrade (everything between the markers is installer-owned),
+# reports vOld -> vNew, and `doctor` flags outdated installs.
+# v1 = any installed block without a stamp line (all installs before this file
+# existed). Templates below are stamped `<!-- relay-logs <name> vN -->`.
+agents-block.md v2
+claude-block.md v2

@@ -80,10 +80,24 @@ adding a second one.
 **Upgrading an existing installation:** if the target already has `.relay/`, the
 runtime files are kept unless `--force` is given. The install output says which
 version is installed and which one the package provides, e.g.
-`relay: kept existing (v1.0.0; use --force to update to v4.0.0)`. Upgrade with:
+`relay: kept existing (v1.0.0; use --force to update to v4.1.0)`. Upgrade with:
 
 ```bash
 ./scripts/install.sh --target /path/to/project --force --backup
+```
+
+Marker blocks (`AGENTS.md`, `CLAUDE.md`) are always refreshed to the current
+templates — no flag needed. Each block carries a version stamp
+(`<!-- relay-logs <name> vN -->`; blocks installed before versioning have none
+and count as v1). The installer reports what changed, e.g.
+`AGENTS.md: updated (unversioned -> v2)`, and skips the write when the block
+is already identical (`unchanged (already v2)`). `doctor` shows the installed
+block version and flags outdated blocks; `.relay/install.json` records
+`block_versions`. To check without writing:
+
+```bash
+./scripts/install.sh --target /path/to/project --dry-run
+python3 scripts/relay_setup.py doctor --target /path/to/project
 ```
 
 `.relay/data` (the existing log) is never touched by an upgrade. The new

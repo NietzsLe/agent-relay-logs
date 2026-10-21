@@ -1,5 +1,20 @@
 # Changelog
 
+## v4.1.0 — browser delegation awareness + versioned marker blocks
+
+- Agent guidance: tasks needing a real browser are delegated by default to the
+  `claude` CLI (`claude --chrome --model sonnet -p "..."`); no local Chrome
+  needed (remote Chrome). Static reads still use `webfetch`. Verify results
+  independently; never paste secrets into delegated prompts. When delegation
+  is unavailable, the agent must say exactly what is missing instead of
+  skipping silently.
+- Marker blocks are now version-stamped (`<!-- relay-logs <name> vN -->`;
+  `templates/VERSIONS` is the registry). Re-running install upgrades blocks
+  wholesale and reports `vOld -> vNew` (`unchanged (already vN)` when
+  identical); `doctor` shows installed block versions and flags outdated ones;
+  `install.json` records `block_versions`. Legacy blocks without a stamp count
+  as unversioned and are upgraded on the next install.
+
 ## v4.0.0 — rhythm enforcement, scope tracking, scoreboard, hooks
 
 - New event types: `scope` (working-scope changes with `--why`), `wait`/`run`

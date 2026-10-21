@@ -1,4 +1,5 @@
 <!-- BEGIN relay-logs -->
+<!-- relay-logs agents-block v2 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The system is local-only and
@@ -49,7 +50,6 @@ and humans must be able to read your work without asking you.
 ```
 
 **Rhythm (checked by the tool, not by memory):**
-
 - `relay tick` prints at most one line when something needs you: silence past
   the reminder, files outside the logged scope, or unread news from other
   sessions. Silence means everything is fine.
@@ -62,6 +62,29 @@ and humans must be able to read your work without asking you.
 - `end` refuses (exit 1, still recorded and closed) on: silence over the limit,
   badly estimated commands, unlogged scope drift, or `done` without `--verify`.
   Re-run with `--force` to accept the penalty.
+
+**Browser interaction (delegated — you have no browser here, and you do not need one):**
+
+Real-browser work (clicking, typing, logged-in sessions, JS-heavy rendering,
+visual verification) is still yours to order: delegate it to the `claude` CLI,
+which drives a remote Chrome. Do this by default whenever such a task comes up
+— no need to be asked first, and no need for local Chrome:
+
+```bash
+claude --chrome --model sonnet -p "<exactly what to do>" \
+  --dangerously-skip-permissions --output-format text
+```
+
+Reading a static page is not this — use `webfetch` for that. Delegate only
+when interaction is required.
+Rules: describe the expected result in the delegated prompt; never paste
+secrets, tokens, or PII into it; log the delegation like any long command
+(`run --eta`); verify the outcome yourself afterwards (re-resolve, re-curl,
+re-read the page) instead of trusting the report blindly.
+If delegation is unavailable in this environment (no `claude` CLI, no
+`--chrome` support, or the required sign-in is missing): do NOT silently skip —
+tell the user exactly what is missing (which tool, which flag, which login) so
+it can be installed.
 
 Rules:
 

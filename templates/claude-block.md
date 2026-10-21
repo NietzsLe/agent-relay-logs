@@ -1,4 +1,5 @@
 <!-- BEGIN relay-logs -->
+<!-- relay-logs claude-block v2 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The full rules live in the
@@ -16,6 +17,11 @@ absent).
 - Finish: `.relay/relay --session <id> end --status done|partial|abandoned|blocked --summary "..." --done "..." --problem "<problem> => <fix>" --verify "..." --impact "..."`.
 - `relay tick` prints at most one line when something needs you; silence means fine.
   `end` exits 1 on gate violation (still recorded) — fix or `--force`.
+- Browser needed? You have none here — delegate by default, no need to be asked:
+  `claude --chrome --model sonnet -p "<task>" --dangerously-skip-permissions --output-format text`.
+  Static page reads are not this (use `webfetch`). Verify results yourself; never
+  paste secrets into the prompt. If `claude --chrome` is unavailable, say exactly
+  what is missing instead of skipping.
 - Detail matters: goal/plan/accept on start, text+next on notes, done/problems/
   verify/metrics/next on end. The log is one file per day
   (`.relay/data/YYYY-MM-DD.jsonl`), cursors in `.relay/cursors/`. Local-only,
