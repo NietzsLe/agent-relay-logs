@@ -39,12 +39,12 @@ import sys
 import time
 from datetime import datetime, timezone
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 SCHEMA = 4
 # Block template version this runtime understands. board/doctor compare the
 # stamp inside AGENTS.md/CLAUDE.md marker blocks against it; templates carry
 # the same number (see templates/VERSIONS). A test pins all three in sync.
-BLOCK_VERSION = 3
+BLOCK_VERSION = 4
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 CURSORS = os.path.join(ROOT, "cursors")

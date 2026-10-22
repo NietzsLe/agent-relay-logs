@@ -49,6 +49,13 @@ exactly what changed.
 - List options are split on commas that are not inside brackets or quotes
   (`--changes "repo (new, commit abc)"` must survive).
 - Any runtime change needs a matching test in `tests/test.sh`.
+- Block content changes must bump the version in one step: edit
+  `templates/agents-block.md` / `templates/claude-block.md`, then run
+  `python3 scripts/relay_setup.py bump-blocks --to vN` (syncs the template
+  stamps, `templates/VERSIONS`, and `BLOCK_VERSION` in `package/relay` so they
+  cannot drift). Never bump the version by hand in individual files. Then
+  add/update a content assert in `tests/test.sh`, run the verification below,
+  and add a `CHANGELOG.md` entry.
 - When you use the relay yourself (in any project), log with the same detail —
   a half-empty log teaches the next session the wrong habit.
 

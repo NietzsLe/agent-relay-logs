@@ -109,10 +109,29 @@ agent-relay-logs/
 │   ├── install.sh             # wrapper -> relay_setup.py install
 │   ├── uninstall.sh           # wrapper -> relay_setup.py uninstall
 │   ├── doctor.sh              # wrapper -> relay_setup.py doctor
-│   └── relay_setup.py         # installer/uninstaller/doctor logic
+│   ├── relay_setup.py         # installer/uninstaller/doctor/bump-blocks logic
+│   └── audit_coverage.py      # coverage audit: harness sessions without relay logs
 └── tests/
     └── test.sh                # end-to-end acceptance tests
 ```
+
+## Coverage audit (multi-harness)
+
+Logging is voluntary, so gaps happen (a short session that never runs
+`start`). `scripts/audit_coverage.py` finds them by comparing this machine's
+harness session stores (opencode sqlite, Claude Code JSONL projects, Codex
+rollouts) against the target's `.relay/data/` day files:
+
+```bash
+python3 scripts/audit_coverage.py --target /path/to/project --since 2026-10-21
+```
+
+A harness session counts as real work with ≥1 user prompt plus tool calls
+(or duration > 60s, or > 1 prompt); it counts as covered when a relay
+session's time window overlaps it. Exit 1 when unlogged real-work sessions
+exist. Matching is heuristic without hooks (`RELAY_KEY`); store paths can be
+overridden for tests via `OPENCODE_DB`, `CLAUDE_PROJECTS_DIR`,
+`CODEX_SESSIONS_DIR`. Read-only: never touches cursors or logs.
 
 ## How the runtime works
 

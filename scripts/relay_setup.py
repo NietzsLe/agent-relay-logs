@@ -21,7 +21,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE = REPO_ROOT / "package"
 TEMPLATES = REPO_ROOT / "templates"
@@ -738,6 +738,73 @@ def cmd_doctor(args):
     return 0 if ok else 1
 
 
+def cmd_bump_blocks(args):
+    """Sync the block version number across templates, registry, and runtime.
+
+    Single source of truth for the number is the --to flag; templates/VERSIONS
+    documents the scheme. Updates the stamp line in each template, the registry,
+    and BLOCK_VERSION in package/relay in one step so they cannot drift apart.
+    """
+    raw = args.to.strip().lower()
+    if raw.startswith("v"):
+        raw = raw[1:]
+    if not raw.isdigit() or int(raw) < 1:
+        fail("--to must be a positive version like v4 (got %r)" % args.to)
+    new_v = int(raw)
+
+    changes = []
+    for _filename, template, _flag, _dest in TARGET_FILES:
+        path = TEMPLATES / template
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as ex:
+            fail("cannot read template %s: %s" % (path, ex))
+        new_text, n = re.subn(r"(relay-logs\s+\S+\s+v)\d+", r"\g<1>%d" % new_v, text, count=1)
+        if n != 1:
+            fail("template %s has no version stamp to bump" % path)
+        if new_text != text:
+            changes.append((path, text, new_text))
+
+    reg_path = TEMPLATES / "VERSIONS"
+    try:
+        reg_text = reg_path.read_text(encoding="utf-8")
+    except OSError as ex:
+        fail("cannot read %s: %s" % (reg_path, ex))
+    new_reg, reg_n = re.subn(r"^(\S+[ \t]+v)\d+[ \t]*$", r"\g<1>%d" % new_v, reg_text,
+                             flags=re.M)
+    if reg_n == 0:
+        fail("%s has no version lines to bump" % reg_path)
+    if new_reg != reg_text:
+        changes.append((reg_path, reg_text, new_reg))
+
+    relay_path = PACKAGE / "relay"
+    try:
+        relay_text = relay_path.read_text(encoding="utf-8")
+    except OSError as ex:
+        fail("cannot read %s: %s" % (relay_path, ex))
+    new_relay, relay_n = re.subn(r"^(BLOCK_VERSION[ \t]*=[ \t]*)\d+[ \t]*$", r"\g<1>%d" % new_v,
+                                 relay_text, flags=re.M)
+    if relay_n != 1:
+        fail("%s has no BLOCK_VERSION line to bump" % relay_path)
+    if new_relay != relay_text:
+        changes.append((relay_path, relay_text, new_relay))
+
+    if not changes:
+        print("block version already v%d everywhere: nothing to do." % new_v)
+        return 0
+    for path, _old, new in changes:
+        if args.dry_run:
+            print("would update %s to v%d" % (path, new_v))
+        else:
+            path.write_text(new, encoding="utf-8")
+            print("updated %s to v%d" % (path, new_v))
+    if args.dry_run:
+        print("dry run complete: no files were written.")
+    else:
+        print("done. Next: add/update a content assert in tests/test.sh, run ./tests/test.sh, add a CHANGELOG entry.")
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="relay_setup.py",
@@ -775,6 +842,11 @@ def build_parser():
     doctor = sub.add_parser("doctor", help="check an installed target")
     doctor.add_argument("--target", default=".", help="target repository (default: current directory)")
     doctor.set_defaults(func=cmd_doctor)
+
+    bump = sub.add_parser("bump-blocks", help="sync the marker-block version number everywhere in one step")
+    bump.add_argument("--to", required=True, help="new block version, e.g. v4")
+    bump.add_argument("--dry-run", action="store_true", help="show actions without writing")
+    bump.set_defaults(func=cmd_bump_blocks)
     return parser
 
 

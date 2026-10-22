@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs agents-block v3 -->
+<!-- relay-logs agents-block v4 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The system is local-only and
@@ -84,6 +84,35 @@ If delegation is unavailable in this environment (no `claude` CLI, no
 `--chrome` support, or the required sign-in is missing): do NOT silently skip —
 tell the user exactly what is missing (which tool, which flag, which login) so
 it can be installed.
+
+**Image generation (delegated — you have no image tool here, but you do via Codex):**
+
+Image work (new illustrations, diagrams, assets, mockups — or edits/variants
+referencing existing images) is still yours to order: delegate it to the
+`codex` CLI, which has a built-in image generation tool. Do this by default
+whenever such a task comes up — no need to be asked first:
+
+```bash
+# create new
+codex exec --skip-git-repo-check -C <project-dir> \
+  "Generate <detailed description: subject, style, colors, composition> and save it as ./<path>.png in the working directory. Use your image generation tool."
+
+# edit / variant from reference image(s)
+codex exec --skip-git-repo-check -C <project-dir> \
+  -i ./ref.png \
+  "Generate <what to make> inspired by the attached reference image(s) and save it as ./<path>.png. Use your image generation tool."
+```
+
+Rules: describe the expected image in detail in the delegated prompt; never
+paste secrets, tokens, or PII into it; log the delegation like any long
+command (`run --eta`); verify the outcome yourself afterwards (read the saved
+file) instead of trusting the report blindly. Generated files land under
+`~/.codex/generated_images/<session>/` before being copied to the working
+directory — if the copy is blocked by the sandbox, copy the file over
+manually. If delegation is unavailable in this environment (no `codex` CLI or
+sign-in missing): do NOT silently skip — tell the user exactly what is
+missing so it can be installed. Never claim you cannot generate images without
+checking Codex first.
 
 **Session start: make sure the relay itself is compatible (do this yourself):**
 - If `.relay/` does not exist here (fresh clone — `.relay` is git-ignored and

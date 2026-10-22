@@ -10,9 +10,9 @@ trap cleanup EXIT HUP INT TERM
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "ok - $*"; }
-contains() { grep -qF "$1" "$2" || fail "$2 is missing: $1"; }
-not_contains() { ! grep -qF "$1" "$2" || fail "$2 still contains: $1"; }
-count() { grep -cF "$1" "$2" 2>/dev/null || true; }
+contains() { grep -qF -- "$1" "$2" || fail "$2 is missing: $1"; }
+not_contains() { ! grep -qF -- "$1" "$2" || fail "$2 still contains: $1"; }
+count() { grep -cF -- "$1" "$2" 2>/dev/null || true; }
 
 # print every event of a session (the log is one file per day, shared)
 events_of() { python3 - "$1" <<'EOF'
@@ -416,42 +416,47 @@ if "$ROOT/scripts/install.sh" --target "$P3" >/dev/null 2>&1; then
 fi
 pass "install refuses to edit unbalanced markers"
 
-# --- v4.1: browser delegation guidance in fresh installs -------------------
+# --- v4.2: browser + image delegation guidance in fresh installs -----------------
 P8="$TMP/project8"
 mkdir -p "$P8"
 "$ROOT/scripts/install.sh" --target "$P8" >/dev/null
 contains "claude --chrome" "$P8/AGENTS.md"
-contains "relay-logs agents-block v3" "$P8/AGENTS.md"
+contains "codex exec" "$P8/AGENTS.md"
+contains "-i ./ref.png" "$P8/AGENTS.md"
+contains "generated_images" "$P8/AGENTS.md"
+contains "relay-logs agents-block v4" "$P8/AGENTS.md"
 contains "claude --chrome" "$P8/CLAUDE.md"
-contains "relay-logs claude-block v3" "$P8/CLAUDE.md"
-python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==3, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==3" \
+contains "codex exec" "$P8/CLAUDE.md"
+contains "relay-logs claude-block v4" "$P8/CLAUDE.md"
+python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==4, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==4" \
     || fail "manifest has no block_versions"
-pass "fresh installs teach browser delegation and stamp block versions"
+pass "fresh installs teach browser and image delegation and stamp block versions"
 
-# --- v4.1: legacy (unstamped) blocks upgrade in place ----------------------
+# --- v4.2: legacy (unstamped) blocks upgrade in place ----------------------
 P9="$TMP/project9"
 mkdir -p "$P9"
 printf '# AGENTS.md\n\nKeep this line.\n\n<!-- BEGIN relay-logs -->\n## Relay — old text\n<!-- END relay-logs -->\n' > "$P9/AGENTS.md"
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "unversioned -> v3" || fail "upgrade did not report unversioned -> v3: $OUT"
+echo "$OUT" | grep -q "unversioned -> v4" || fail "upgrade did not report unversioned -> v4: $OUT"
 contains "claude --chrome" "$P9/AGENTS.md"
-contains "relay-logs agents-block v3" "$P9/AGENTS.md"
+contains "codex exec" "$P9/AGENTS.md"
+contains "relay-logs agents-block v4" "$P9/AGENTS.md"
 contains "Keep this line." "$P9/AGENTS.md"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "upgrade duplicated the block"
 pass "legacy blocks upgrade to the versioned template, user text kept"
 
-# --- v4.1: doctor flags outdated blocks, reinstall is a no-op when current -
-sed -i 's/relay-logs agents-block v3/relay-logs agents-block v1/' "$P9/AGENTS.md"
+# --- v4.2: doctor flags outdated blocks, reinstall is a no-op when current -
+sed -i 's/relay-logs agents-block v4/relay-logs agents-block v1/' "$P9/AGENTS.md"
 OUT=$("$ROOT/scripts/relay_setup.py" doctor --target "$P9" 2>&1)
 echo "$OUT" | grep -q "outdated" || fail "doctor did not flag the outdated block"
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "v1 -> v3" || fail "reinstall did not report v1 -> v3: $OUT"
+echo "$OUT" | grep -q "v1 -> v4" || fail "reinstall did not report v1 -> v4: $OUT"
 OUT2=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT2" | grep -q "unchanged (already v3)" || fail "second install is not a no-op: $OUT2"
+echo "$OUT2" | grep -q "unchanged (already v4)" || fail "second install is not a no-op: $OUT2"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "reinstall duplicated the block"
 pass "doctor flags outdated blocks; reinstall upgrades once, then is a no-op"
 
-# --- v4.1: version constants stay in sync across runtime/templates/registry --
+# --- v4.2: version constants stay in sync across runtime/templates/registry --
 python3 - "$ROOT" <<'EOF'
 import re, sys
 root = sys.argv[1]
@@ -487,8 +492,8 @@ mkdir -p "$P10"
 cd "$P10"
 git init -q . 2>/dev/null || true
 OUT=$(./.relay/relay --agent probe --session "probe-$$" board 2>&1)
-echo "$OUT" | grep -q "blocks: v3 OK" || fail "board did not report current blocks: $OUT"
-sed -i 's/relay-logs agents-block v3/relay-logs agents-block v1/' AGENTS.md
+echo "$OUT" | grep -q "blocks: v4 OK" || fail "board did not report current blocks: $OUT"
+sed -i 's/relay-logs agents-block v4/relay-logs agents-block v1/' AGENTS.md
 OUT2=$(./.relay/relay --agent probe --session "probe2-$$" board 2>&1)
 echo "$OUT2" | grep -qi "outdated" || fail "board did not flag the outdated block: $OUT2"
 echo "$OUT2" | grep -q "AGENTS.md" || fail "board did not name the outdated file: $OUT2"
@@ -497,7 +502,106 @@ echo "$OUT3" | grep -q "OUTDATED" || fail "doctor did not flag the outdated bloc
 echo "$OUT3" | grep -q "up to date" || fail "doctor did not confirm the current block"
 "$ROOT/scripts/install.sh" --target "$P10" >/dev/null
 OUT4=$(./.relay/relay --agent probe --session "probe3-$$" board 2>&1)
-echo "$OUT4" | grep -q "blocks: v3 OK" || fail "board not green after upgrade: $OUT4"
+echo "$OUT4" | grep -q "blocks: v4 OK" || fail "board not green after upgrade: $OUT4"
 pass "board and doctor flag outdated blocks; upgrade closes the loop"
+
+# --- audit coverage: multi-harness unlogged-session detection --------------
+AUD="$TMP/audit-proj"
+mkdir -p "$AUD/.relay/data"
+cat > "$AUD/.relay/data/2026-10-21.jsonl" <<'EOF'
+{"id": "t1", "ts": "2026-10-21T10:00:00Z", "type": "join", "session": "rs-covered", "agent": "opencode", "cwd": ".", "branch": "main", "head": "abc"}
+{"id": "t2", "ts": "2026-10-21T10:01:00Z", "type": "start", "session": "rs-covered", "agent": "opencode", "title": "logged task", "scope": ["a.py"]}
+{"id": "t3", "ts": "2026-10-21T10:05:00Z", "type": "end", "session": "rs-covered", "agent": "opencode", "status": "done", "summary": "ok", "verify": ["green"]}
+EOF
+AUDDB="$TMP/audit-opencode.db"
+python3 - "$AUDDB" "$AUD" <<'EOF'
+import sqlite3, sys
+db, target = sys.argv[1], sys.argv[2]
+con = sqlite3.connect(db)
+con.execute("CREATE TABLE session_v2 (id TEXT, title TEXT, agent TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER)")
+con.execute("CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT)")
+# relay window is 10:00-10:05Z = 1792576800000-1792577100000 ms
+con.execute("INSERT INTO session_v2 VALUES ('ses-logged','logged opencode task','build',?,1792576860000,1792577100000)", (target,))
+con.execute("INSERT INTO session_message VALUES ('ses-logged','user','{\"text\":\"do work\"}')")
+con.execute("INSERT INTO session_message VALUES ('ses-logged','assistant','{\"content\":[{\"type\":\"tool\"}]}')")
+con.execute("INSERT INTO session_v2 VALUES ('ses-missed','missed image task','build',?,1792577280000,1792577400000)", (target,))
+con.execute("INSERT INTO session_message VALUES ('ses-missed','user','{\"text\":\"gen image\"}')")
+con.execute("INSERT INTO session_message VALUES ('ses-missed','assistant','{\"content\":[{\"type\":\"tool\"}]}')")
+con.commit()
+con.close()
+EOF
+# fake claude store: project dir name is the target path with / -> -
+AUDCL="$TMP/audit-claude/$(printf '%s' "$AUD" | sed 's/\//-/g')"
+mkdir -p "$AUDCL"
+cat > "$AUDCL/aaaa1111.jsonl" <<'EOF'
+{"type": "user", "sessionId": "aaaa1111", "timestamp": "2026-10-21T10:08:00.000Z", "message": {"content": "missed claude task"}}
+{"type": "assistant", "sessionId": "aaaa1111", "timestamp": "2026-10-21T10:09:00.000Z", "content": [{"type": "tool_use"}]}
+EOF
+# fake codex store: rollout with session_meta cwd + user + exec line
+AUDCX="$TMP/audit-codex/2026/10/21"
+mkdir -p "$AUDCX"
+CODEVTARGET="$AUD" python3 - "$AUDCX/rollout-test.jsonl" <<'EOF'
+import json, os, sys
+path = sys.argv[1]
+cwd = os.environ["CODEVTARGET"]
+with open(path, "w") as fh:
+    fh.write(json.dumps({"type": "session_meta", "payload": {"id": "01a1miss", "cwd": cwd}}) + "\n")
+    fh.write(json.dumps({"type": "response_item", "timestamp": "2026-10-21T10:12:00.000Z", "payload": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]}}) + "\n")
+    fh.write(json.dumps({"type": "event_msg", "timestamp": "2026-10-21T10:13:00.000Z", "payload": {"type": "exec_command_begin"}}) + "\n")
+EOF
+AUDOUT=$(OPENCODE_DB="$AUDDB" CLAUDE_PROJECTS_DIR="$TMP/audit-claude" CODEX_SESSIONS_DIR="$TMP/audit-codex" \
+    python3 "$ROOT/scripts/audit_coverage.py" --target "$AUD" --since 2026-10-21 --until 2026-10-21 2>&1) \
+    || true
+echo "$AUDOUT" | grep -q "ses-missed" || fail "audit did not flag the unlogged opencode session"
+echo "$AUDOUT" | grep -q "aaaa1111" || fail "audit did not flag the unlogged claude session"
+echo "$AUDOUT" | grep -q "01a1miss" || fail "audit did not flag the unlogged codex session"
+echo "$AUDOUT" | grep -q "ses-logged" && fail "audit flagged a covered session as unlogged"
+OPENCODE_DB="$AUDDB" CLAUDE_PROJECTS_DIR="$TMP/audit-claude" CODEX_SESSIONS_DIR="$TMP/audit-codex" \
+    python3 "$ROOT/scripts/audit_coverage.py" --target "$AUD" --since 2026-10-21 --until 2026-10-21 >/dev/null 2>&1 \
+    && fail "audit should exit 1 when gaps exist"
+OPENCODE_DB="$AUDDB" CLAUDE_PROJECTS_DIR="$TMP/audit-claude" CODEX_SESSIONS_DIR="$TMP/audit-codex" \
+    python3 "$ROOT/scripts/audit_coverage.py" --target "$AUD" --since 2026-10-22 --until 2026-10-22 >/dev/null 2>&1 \
+    || fail "audit should exit 0 when no harness session is in range"
+pass "audit flags unlogged sessions across opencode/claude/codex stores"
+
+# --- opencode nudge plugin stays valid JS (V2 contract) ---------------------
+if command -v node >/dev/null 2>&1; then
+    node --check "$ROOT/scripts/hooks/opencode-nudge.js" \
+        || fail "opencode-nudge.js is not valid JS"
+    pass "nudge plugin is valid JS"
+fi
+grep -q "export default" "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must have a default export (V2 contract)"
+grep -q "Plugin.define" "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must use Plugin.define (V2 contract)"
+grep -q 'id: "relay-nudge"' "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must define id relay-nudge"
+grep -q "ctx.session.hook" "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must register a session hook"
+grep -q "ctx.tool.hook" "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must register tool hooks"
+grep -q "ctx.shell.hook" "$ROOT/scripts/hooks/opencode-nudge.js" \
+    || fail "nudge plugin must register a shell hook"
+if grep -q "RelayNudgePlugin" "$ROOT/scripts/hooks/opencode-nudge.js"; then
+    fail "nudge plugin still exports the V1 RelayNudgePlugin symbol"
+fi
+if grep -q '"shell.env"' "$ROOT/scripts/hooks/opencode-nudge.js"; then
+    fail "nudge plugin still uses the V1 shell.env hook key"
+fi
+pass "nudge plugin meets the V2 contract"
+
+# --- v4.2: bump-blocks keeps templates, registry, and runtime in sync ------
+"$ROOT/scripts/relay_setup.py" bump-blocks --to v4 --dry-run 2>&1 \
+    | grep -q "already v4" || fail "bump-blocks --dry-run should report already-v4"
+if "$ROOT/scripts/relay_setup.py" bump-blocks --to banana >/dev/null 2>&1; then
+    fail "bump-blocks should reject a non-numeric version"
+fi
+DRY=$("$ROOT/scripts/relay_setup.py" bump-blocks --to v5 --dry-run 2>&1)
+echo "$DRY" | grep -q "would update" || fail "bump-blocks --dry-run reported no updates for v5"
+grep -q "relay-logs agents-block v4" "$ROOT/templates/agents-block.md" \
+    || fail "dry run must not rewrite the agents stamp"
+grep -q "^BLOCK_VERSION = 4$" "$ROOT/package/relay" \
+    || fail "dry run must not rewrite BLOCK_VERSION"
+pass "bump-blocks syncs stamps, registry, and runtime in one step"
 
 echo "all tests passed"

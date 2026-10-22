@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs claude-block v3 -->
+<!-- relay-logs claude-block v4 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The full rules live in the
@@ -22,6 +22,12 @@ absent).
   Static page reads are not this (use `webfetch`). Verify results yourself; never
   paste secrets into the prompt. If `claude --chrome` is unavailable, say exactly
   what is missing instead of skipping.
+- Images needed? You have no image tool here — but you do via Codex, so
+  delegate by default, no need to be asked:
+  `codex exec --skip-git-repo-check -C <dir> [-i ./ref.png] "<detailed image description> and save it as ./<path>.png. Use your image generation tool."`.
+  Reference image(s) go in `-i`; verify the saved file yourself; never paste
+  secrets into the prompt. If `codex` is unavailable, say exactly what is
+  missing instead of skipping or claiming images are impossible.
 - Session start: if no `.relay/` here (fresh clone — it is git-ignored), fetch
   the installer repo and run `install.sh --target .` first; if `board` says your
   blocks are OUTDATED, rerun the installer to upgrade. Never work on a stale

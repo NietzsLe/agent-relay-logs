@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- Nudge plugin reminds once per session at the first chat request (`board` +
+  `start`, including short tests and `/tmp` outputs) — the only net that
+  catches sessions too short for tick-based nudges. `node --check` pins the
+  plugin syntax in `tests/test.sh`.
+- New `scripts/audit_coverage.py`: cross-checks opencode/Claude/Codex session
+  stores on the local machine against the target's `.relay/data/` and reports
+  real-work harness sessions with no overlapping relay session (exit 1).
+  Read-only; heuristic matching without hooks; store paths overridable for
+  tests. `README.md` documents usage.
+
+## v4.2.0 — image generation via Codex, one-step block bump
+
+- Agent guidance: tasks needing images (new illustrations, diagrams, assets,
+  mockups — or edits/variants from reference images) are delegated by default
+  to the `codex` CLI (`codex exec --skip-git-repo-check -C <dir> [-i ref.png]
+  "... save as ./<path>.png. Use your image generation tool."`), which has a
+  built-in image generation tool. Reference images attach with repeatable `-i`;
+  verify the saved file afterwards; never paste secrets into delegated prompts.
+  When Codex is unavailable, the agent must say exactly what is missing instead
+  of skipping or claiming images are impossible.
+- Block versions are now bumped in one step: `python3 scripts/relay_setup.py
+  bump-blocks --to vN` syncs the template stamps, `templates/VERSIONS`, and
+  `BLOCK_VERSION` in `package/relay`. `AGENTS.md` documents the checklist
+  (bump → content assert in `tests/test.sh` → verify → CHANGELOG entry).
+
 ## v4.1.0 — browser delegation, versioned blocks, self-healing setup
 
 - Agent guidance: tasks needing a real browser are delegated by default to the
