@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Browser delegation now mandates the cheapest model: `claude --chrome
+  --model haiku ...` in both `templates/agents-block.md` and
+  `templates/claude-block.md` (block v5). Agents MUST use `--model haiku` and
+  must not upgrade to `sonnet`/`opus` unless the user explicitly asks.
+  Existing installs upgrade wholesale on the next `install.sh` run
+  (`v4 -> v5`, legacy unversioned -> v5); `doctor`/`board` flag outdated
+  blocks until then.
 - Nudge plugin reminds once per session at the first chat request (`board` +
   `start`, including short tests and `/tmp` outputs) — the only net that
   catches sessions too short for tick-based nudges. `node --check` pins the

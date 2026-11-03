@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs agents-block v4 -->
+<!-- relay-logs agents-block v5 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The system is local-only and
@@ -70,13 +70,15 @@ which drives a remote Chrome. Do this by default whenever such a task comes up
 — no need to be asked first, and no need for local Chrome:
 
 ```bash
-claude --chrome --model sonnet -p "<exactly what to do>" \
+claude --chrome --model haiku -p "<exactly what to do>" \
   --dangerously-skip-permissions --output-format text
 ```
 
 Reading a static page is not this — use `webfetch` for that. Delegate only
 when interaction is required.
-Rules: describe the expected result in the delegated prompt; never paste
+Rules: you MUST use `--model haiku` (the cheapest model) for browser delegation;
+do NOT upgrade to `sonnet`/`opus` unless the user explicitly asks. Describe the
+expected result in the delegated prompt; never paste
 secrets, tokens, or PII into it; log the delegation like any long command
 (`run --eta`); verify the outcome yourself afterwards (re-resolve, re-curl,
 re-read the page) instead of trusting the report blindly.

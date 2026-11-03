@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs claude-block v4 -->
+<!-- relay-logs claude-block v5 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The full rules live in the
@@ -18,8 +18,9 @@ absent).
 - `relay tick` prints at most one line when something needs you; silence means fine.
   `end` exits 1 on gate violation (still recorded) — fix or `--force`.
 - Browser needed? You have none here — delegate by default, no need to be asked:
-  `claude --chrome --model sonnet -p "<task>" --dangerously-skip-permissions --output-format text`.
-  Static page reads are not this (use `webfetch`). Verify results yourself; never
+  `claude --chrome --model haiku -p "<task>" --dangerously-skip-permissions --output-format text`.
+  MUST use `--model haiku` (cheapest); never upgrade to sonnet/opus unless the user
+  explicitly asks. Static page reads are not this (use `webfetch`). Verify results yourself; never
   paste secrets into the prompt. If `claude --chrome` is unavailable, say exactly
   what is missing instead of skipping.
 - Images needed? You have no image tool here — but you do via Codex, so
