@@ -416,7 +416,7 @@ if "$ROOT/scripts/install.sh" --target "$P3" >/dev/null 2>&1; then
 fi
 pass "install refuses to edit unbalanced markers"
 
-# --- v5: browser + image delegation guidance in fresh installs -----------------
+# --- v6: browser + image delegation guidance in fresh installs -----------------
 P8="$TMP/project8"
 mkdir -p "$P8"
 "$ROOT/scripts/install.sh" --target "$P8" >/dev/null
@@ -426,37 +426,43 @@ contains "MUST use" "$P8/AGENTS.md"
 contains "codex exec" "$P8/AGENTS.md"
 contains "-i ./ref.png" "$P8/AGENTS.md"
 contains "generated_images" "$P8/AGENTS.md"
-contains "relay-logs agents-block v5" "$P8/AGENTS.md"
+contains "relay-logs agents-block v6" "$P8/AGENTS.md"
 contains "claude --chrome" "$P8/CLAUDE.md"
 contains "--model haiku" "$P8/CLAUDE.md"
 contains "codex exec" "$P8/CLAUDE.md"
-contains "relay-logs claude-block v5" "$P8/CLAUDE.md"
-python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==5, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==5" \
+contains "relay-logs claude-block v6" "$P8/CLAUDE.md"
+contains "local match" "$P8/AGENTS.md"
+contains "stale runtime" "$P8/AGENTS.md"
+contains "Source of truth for freshness" "$P8/AGENTS.md"
+python3 -c "import json; d=json.load(open('$P8/.relay/install.json')); assert d.get('block_versions',{}).get('AGENTS.md')==6, d.get('block_versions'); assert d.get('block_versions',{}).get('CLAUDE.md')==6" \
     || fail "manifest has no block_versions"
 pass "fresh installs teach browser and image delegation and stamp block versions"
 
-# --- v5: legacy (unstamped) blocks upgrade in place ----------------------
+# --- v6: legacy (unstamped) blocks upgrade in place ----------------------
 P9="$TMP/project9"
 mkdir -p "$P9"
 printf '# AGENTS.md\n\nKeep this line.\n\n<!-- BEGIN relay-logs -->\n## Relay — old text\n<!-- END relay-logs -->\n' > "$P9/AGENTS.md"
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "unversioned -> v5" || fail "upgrade did not report unversioned -> v5: $OUT"
+echo "$OUT" | grep -q "unversioned -> v6" || fail "upgrade did not report unversioned -> v6: $OUT"
 contains "claude --chrome" "$P9/AGENTS.md"
 contains "--model haiku" "$P9/AGENTS.md"
 contains "codex exec" "$P9/AGENTS.md"
-contains "relay-logs agents-block v5" "$P9/AGENTS.md"
+contains "relay-logs agents-block v6" "$P9/AGENTS.md"
 contains "Keep this line." "$P9/AGENTS.md"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "upgrade duplicated the block"
 pass "legacy blocks upgrade to the versioned template, user text kept"
 
-# --- v5: doctor flags outdated blocks, reinstall is a no-op when current -
-sed -i 's/relay-logs agents-block v5/relay-logs agents-block v1/' "$P9/AGENTS.md"
-OUT=$("$ROOT/scripts/relay_setup.py" doctor --target "$P9" 2>&1)
+# --- v6: doctor flags outdated blocks, reinstall is a no-op when current -
+sed -i 's/relay-logs agents-block v6/relay-logs agents-block v1/' "$P9/AGENTS.md"
+OUT=$("$ROOT/scripts/relay_setup.py" doctor --target "$P9" 2>&1 || true)
 echo "$OUT" | grep -q "outdated" || fail "doctor did not flag the outdated block"
+if "$ROOT/scripts/relay_setup.py" doctor --target "$P9" >/dev/null 2>&1; then
+    fail "installer doctor should exit 1 on outdated blocks"
+fi
 OUT=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT" | grep -q "v1 -> v5" || fail "reinstall did not report v1 -> v5: $OUT"
+echo "$OUT" | grep -q "v1 -> v6" || fail "reinstall did not report v1 -> v6: $OUT"
 OUT2=$("$ROOT/scripts/install.sh" --target "$P9" 2>&1)
-echo "$OUT2" | grep -q "unchanged (already v5)" || fail "second install is not a no-op: $OUT2"
+echo "$OUT2" | grep -q "unchanged (already v6)" || fail "second install is not a no-op: $OUT2"
 [ "$(count "BEGIN relay-logs" "$P9/AGENTS.md")" = "1" ] || fail "reinstall duplicated the block"
 pass "doctor flags outdated blocks; reinstall upgrades once, then is a no-op"
 
@@ -496,18 +502,48 @@ mkdir -p "$P10"
 cd "$P10"
 git init -q . 2>/dev/null || true
 OUT=$(./.relay/relay --agent probe --session "probe-$$" board 2>&1)
-echo "$OUT" | grep -q "blocks: v5 OK" || fail "board did not report current blocks: $OUT"
-sed -i 's/relay-logs agents-block v5/relay-logs agents-block v1/' AGENTS.md
+echo "$OUT" | grep -q "blocks: v6 match runtime v6" || fail "board did not report current blocks: $OUT"
+echo "$OUT" | grep -q "source may be newer" || fail "board does not warn that source may be newer: $OUT"
+! echo "$OUT" | grep -q "blocks: v6 OK" || fail "board still claims absolute OK instead of local match: $OUT"
+sed -i 's/relay-logs agents-block v6/relay-logs agents-block v1/' AGENTS.md
 OUT2=$(./.relay/relay --agent probe --session "probe2-$$" board 2>&1)
 echo "$OUT2" | grep -qi "outdated" || fail "board did not flag the outdated block: $OUT2"
 echo "$OUT2" | grep -q "AGENTS.md" || fail "board did not name the outdated file: $OUT2"
+echo "$OUT2" | grep -q "local runtime wants" || fail "board does not name the local runtime: $OUT2"
 OUT3=$(./.relay/relay doctor 2>&1)
 echo "$OUT3" | grep -q "OUTDATED" || fail "doctor did not flag the outdated block"
-echo "$OUT3" | grep -q "up to date" || fail "doctor did not confirm the current block"
+echo "$OUT3" | grep -q "matches local runtime" || fail "doctor did not confirm the current block as local match"
+echo "$OUT3" | grep -q "source check" || fail "doctor does not point at the installer source check"
 "$ROOT/scripts/install.sh" --target "$P10" >/dev/null
 OUT4=$(./.relay/relay --agent probe --session "probe3-$$" board 2>&1)
-echo "$OUT4" | grep -q "blocks: v5 OK" || fail "board not green after upgrade: $OUT4"
+echo "$OUT4" | grep -q "blocks: v6 match runtime v6" || fail "board not green after upgrade: $OUT4"
 pass "board and doctor flag outdated blocks; upgrade closes the loop"
+
+# --- v6: stale runtime + stale block still match locally, installer doctor catches it -
+P11="$TMP/project11"
+mkdir -p "$P11"
+"$ROOT/scripts/install.sh" --target "$P11" >/dev/null
+cd "$P11"
+git init -q . 2>/dev/null || true
+python3 - <<'EOF'
+import re
+p = ".relay/relay"
+t = open(p, encoding="utf-8").read()
+t = re.sub(r"^BLOCK_VERSION\s*=\s*\d+", "BLOCK_VERSION = 5", t, flags=re.M)
+open(p, "w", encoding="utf-8").write(t)
+EOF
+sed -i 's/relay-logs agents-block v6/relay-logs agents-block v5/' AGENTS.md
+sed -i 's/relay-logs claude-block v6/relay-logs claude-block v5/' CLAUDE.md
+OUTB=$(./.relay/relay board 2>&1 | tail -1)
+echo "$OUTB" | grep -q "match runtime v5" || fail "stale pair should match locally: $OUTB"
+echo "$OUTB" | grep -q "source may be newer" || fail "stale pair hides the source warning: $OUTB"
+OUTD=$("$ROOT/scripts/relay_setup.py" doctor --target "$P11" 2>&1 || true)
+echo "$OUTD" | grep -q "stale runtime" || fail "installer doctor did not flag the stale runtime: $OUTD"
+echo "$OUTD" | grep -q "outdated" || fail "installer doctor did not flag the stale blocks: $OUTD"
+if "$ROOT/scripts/relay_setup.py" doctor --target "$P11" >/dev/null 2>&1; then
+    fail "installer doctor should exit 1 on stale runtime + outdated blocks"
+fi
+pass "stale runtime blindness is caught by installer doctor, not hidden by board"
 
 # --- audit coverage: multi-harness unlogged-session detection --------------
 AUD="$TMP/audit-proj"
@@ -594,17 +630,17 @@ if grep -q '"shell.env"' "$ROOT/scripts/hooks/opencode-nudge.js"; then
 fi
 pass "nudge plugin meets the V2 contract"
 
-# --- v5: bump-blocks keeps templates, registry, and runtime in sync ------
-"$ROOT/scripts/relay_setup.py" bump-blocks --to v5 --dry-run 2>&1 \
-    | grep -q "already v5" || fail "bump-blocks --dry-run should report already-v5"
+# --- v6: bump-blocks keeps templates, registry, and runtime in sync ------
+"$ROOT/scripts/relay_setup.py" bump-blocks --to v6 --dry-run 2>&1 \
+    | grep -q "already v6" || fail "bump-blocks --dry-run should report already-v6"
 if "$ROOT/scripts/relay_setup.py" bump-blocks --to banana >/dev/null 2>&1; then
     fail "bump-blocks should reject a non-numeric version"
 fi
-DRY=$("$ROOT/scripts/relay_setup.py" bump-blocks --to v6 --dry-run 2>&1)
-echo "$DRY" | grep -q "would update" || fail "bump-blocks --dry-run reported no updates for v6"
-grep -q "relay-logs agents-block v5" "$ROOT/templates/agents-block.md" \
+DRY=$("$ROOT/scripts/relay_setup.py" bump-blocks --to v7 --dry-run 2>&1)
+echo "$DRY" | grep -q "would update" || fail "bump-blocks --dry-run reported no updates for v7"
+grep -q "relay-logs agents-block v6" "$ROOT/templates/agents-block.md" \
     || fail "dry run must not rewrite the agents stamp"
-grep -q "^BLOCK_VERSION = 5$" "$ROOT/package/relay" \
+grep -q "^BLOCK_VERSION = 6$" "$ROOT/package/relay" \
     || fail "dry run must not rewrite BLOCK_VERSION"
 pass "bump-blocks syncs stamps, registry, and runtime in one step"
 

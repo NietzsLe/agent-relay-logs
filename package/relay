@@ -44,7 +44,7 @@ SCHEMA = 4
 # Block template version this runtime understands. board/doctor compare the
 # stamp inside AGENTS.md/CLAUDE.md marker blocks against it; templates carry
 # the same number (see templates/VERSIONS). A test pins all three in sync.
-BLOCK_VERSION = 5
+BLOCK_VERSION = 6
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 CURSORS = os.path.join(ROOT, "cursors")
@@ -958,17 +958,24 @@ def block_status_lines():
 
 
 def format_block_status():
-    """Compact board line; empty string when everything is current."""
+    """Compact board line; only claims a local match, never global freshness.
+
+    A stale runtime paired with a stale block (e.g. both v4 while the
+    installer source is already v5) still matches locally, so "OK" would lie.
+    The wording therefore says "match runtime" and points at the installer
+    repo as the source of truth for newer releases.
+    """
     missing = [n for n, v, s in block_status_lines() if s != "ok" or v is None]
     outdated = [(n, v) for n, v, s in block_status_lines()
                 if s == "ok" and v is not None and v != BLOCK_VERSION]
     if not missing and not outdated:
-        return "blocks: v%d OK" % BLOCK_VERSION
+        return ("blocks: v%d match runtime v%d "
+                "(source may be newer — verify via installer repo)") % (BLOCK_VERSION, BLOCK_VERSION)
     parts = []
     if missing:
         parts.append("missing block in %s" % ", ".join(missing))
     for name, ver in outdated:
-        parts.append("%s v%s outdated (runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
+        parts.append("%s v%s outdated (local runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
     return "blocks: " + "; ".join(parts)
 
 
@@ -1278,9 +1285,13 @@ def doctor():
         if ver is None:
             print("%s: block unversioned (legacy — rerun installer to upgrade)" % name)
         elif ver == BLOCK_VERSION:
-            print("%s: block v%d (up to date)" % (name, ver))
+            print("%s: block v%d matches local runtime v%d "
+                  "(installer source may be newer — verify via installer repo)" % (name, ver, BLOCK_VERSION))
         else:
-            print("%s: block v%d OUTDATED (runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
+            print("%s: block v%d OUTDATED (local runtime wants v%d — rerun installer)" % (name, ver, BLOCK_VERSION))
+    print("source check: board/doctor only compare against this installed runtime; "
+          "the installer repo may carry a newer BLOCK_VERSION — "
+          "verify with `python3 scripts/relay_setup.py doctor --target <this>` from the agent-relay-logs checkout")
     for fn in data_files():
         evs, _ = read_file(fn)
         kinds = {}

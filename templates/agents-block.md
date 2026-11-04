@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs agents-block v5 -->
+<!-- relay-logs agents-block v6 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The system is local-only and
@@ -122,9 +122,19 @@ checking Codex first.
   (`git@github.com:NietzsLe/agent-relay-logs.git`, shallow clone is enough) and
   run its `install.sh --target .` before starting real work. If you have no
   network access to it, say so instead of working without a log.
-- Run `.relay/relay board` first anyway: if it reports your blocks OUTDATED
-  (installed vX, runtime wants vY), rerun the installer to upgrade, then
-  continue. Never work a whole session on a stale setup in silence.
+- Run `.relay/relay board` first anyway. It only compares the installed blocks
+  against the installed runtime (a local match), never against the installer
+  source: `blocks: vX match runtime vX` means local agreement, NOT "no newer
+  release exists". A stale runtime paired with a stale block (both vX while the
+  source is already vY) still reports a match — that is the outdated-blindness
+  this rule exists to prevent.
+- Source of truth for freshness is the installer checkout:
+  `python3 scripts/relay_setup.py doctor --target <this>` compares the
+  installed blocks AND the installed runtime against the current
+  templates/package. If it reports `outdated` or `stale runtime`, rerun
+  `./scripts/install.sh --target <this> --force --backup`, then continue.
+  If the installer repo is unavailable, say so and treat `board` as
+  local-only. Never work a whole session on a stale setup in silence.
 
 Rules:
 

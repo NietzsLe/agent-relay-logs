@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Fix stale-runtime outdated blindness (block v6): `board`/`doctor` no longer
+  claim absolute freshness (`blocks: vN OK`, `up to date`). They report a local
+  match only (`blocks: vN match runtime vN`) plus `source may be newer — verify
+  via installer repo`, so a v4 runtime + v4 blocks no longer hides that the
+  source is already v5/v6. `scripts/relay_setup.py doctor --target …` is now
+  the source of truth: it compares installed blocks AND the installed runtime
+  (`VERSION` + `BLOCK_VERSION`) against `templates/` + `package/`, reports
+  `outdated` blocks and `stale runtime`, and exits 1 on either. Templates
+  teach the two-level check at session start; `README.md`/`INSTALL.md`/
+  `package/README.md` document it so future bumps keep the split.
+  Upgrade path: `./scripts/install.sh --target <project> --force --backup`.
+
 - Browser delegation now mandates the cheapest model: `claude --chrome
   --model haiku ...` in both `templates/agents-block.md` and
   `templates/claude-block.md` (block v5). Agents MUST use `--model haiku` and

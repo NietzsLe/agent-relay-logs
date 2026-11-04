@@ -219,3 +219,7 @@ See the `agent-relay-logs` repository: `INSTALL.md` and `UNINSTALL.md`. The
 short version: `scripts/install.sh` / `scripts/uninstall.sh` with
 `--target <project>`. Upgrading an existing installation to a newer runtime
 needs `--force` (the runtime file is replaced, `data/` is never touched).
+After any block bump, rerun the installer with `--force --backup` on every
+known target: a target whose runtime and blocks are both one generation old
+still matches locally, so only the installer checkout
+(`relay_setup.py doctor --target …`) can reveal that it is stale.

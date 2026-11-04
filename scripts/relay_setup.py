@@ -225,6 +225,17 @@ def runtime_version(path=None):
     return match.group(1) if match else "?"
 
 
+def runtime_block_version(path=None):
+    """Read BLOCK_VERSION of a relay runtime file; None when unreadable."""
+    path = path or (PACKAGE / "relay")
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^BLOCK_VERSION\s*=\s*(\d+)", text, re.M)
+    return int(match.group(1)) if match else None
+
+
 # --------------------------------------------------------------------------- hooks
 def _hook_marker(text):
     return "relay tick --hook" in text or "relay guard --stop" in text
@@ -681,6 +692,14 @@ def cmd_doctor(args):
         executable = os.access(relay, os.X_OK)
         print("relay: present (%s)" % ("executable" if executable else "NOT executable"))
         ok = ok and executable
+        src_ver, dst_ver = runtime_version(), runtime_version(relay)
+        src_block, dst_block = runtime_block_version(), runtime_block_version(relay)
+        if dst_ver != src_ver or dst_block != src_block:
+            print("runtime: v%s BLOCK v%s installed, package provides v%s BLOCK v%s "
+                  "(stale runtime — rerun install --force to upgrade)" % (dst_ver, dst_block, src_ver, src_block))
+            ok = False
+        else:
+            print("runtime: v%s BLOCK v%s (matches package)" % (dst_ver, dst_block))
     else:
         print("relay: MISSING")
         ok = False
@@ -705,6 +724,7 @@ def cmd_doctor(args):
         have_label = ("v%d" % have) if have is not None else "unversioned"
         if want is not None and have != want:
             print("%s: block %s installed, template is v%d (outdated — rerun install to upgrade)" % (filename, have_label, want))
+            ok = False
         elif want is not None:
             print("%s: block v%d (up to date)" % (filename, want))
 

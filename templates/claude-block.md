@@ -1,5 +1,5 @@
 <!-- BEGIN relay-logs -->
-<!-- relay-logs claude-block v5 -->
+<!-- relay-logs claude-block v6 -->
 ## Relay — cross-agent work log
 
 This project uses **agent-relay-logs** (`.relay/`). The full rules live in the
@@ -30,9 +30,13 @@ absent).
   secrets into the prompt. If `codex` is unavailable, say exactly what is
   missing instead of skipping or claiming images are impossible.
 - Session start: if no `.relay/` here (fresh clone — it is git-ignored), fetch
-  the installer repo and run `install.sh --target .` first; if `board` says your
-  blocks are OUTDATED, rerun the installer to upgrade. Never work on a stale
-  setup in silence.
+  the installer repo and run `install.sh --target .` first. `board` only checks
+  a local match (blocks vs installed runtime: `match runtime vX` is NOT "no
+  newer release"); freshness source of truth is the installer checkout:
+  `python3 scripts/relay_setup.py doctor --target <this>` flags `outdated`
+  blocks and `stale runtime` — rerun the installer with `--force --backup` then.
+  If the installer repo is unavailable, say so and treat `board` as local-only.
+  Never work on a stale setup in silence.
 - Detail matters: goal/plan/accept on start, text+next on notes, done/problems/
   verify/metrics/next on end. The log is one file per day
   (`.relay/data/YYYY-MM-DD.jsonl`), cursors in `.relay/cursors/`. Local-only,

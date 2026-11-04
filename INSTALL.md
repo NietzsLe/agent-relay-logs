@@ -101,10 +101,24 @@ python3 scripts/relay_setup.py doctor --target /path/to/project
 ```
 
 `.relay/data` (the existing log) is never touched by an upgrade. Agents
-self-check at session start: every `board` prints block status (`blocks: vN OK`
-or names outdated/missing files), and the installed blocks instruct the agent
-to fetch this repo and (re)install when `.relay/` is absent (fresh clone) or
-blocks are outdated — no manual version tracking needed. The new
+self-check at session start, but the check has two levels — this is
+deliberate and must stay this way for every future block bump:
+
+- **Local match** (`<target>/.relay/relay board` / `relay doctor`): compares
+  the installed blocks only against the installed runtime. `blocks: vN match
+  runtime vN` means local agreement, NOT "no newer release exists". A stale
+  runtime paired with a stale block (both vX while the source is already vY)
+  still reports a match.
+- **Source of truth** (from this checkout):
+  `python3 scripts/relay_setup.py doctor --target /path/to/project`
+  compares the installed blocks AND the installed runtime against the current
+  `templates/` + `package/`. It reports `outdated` blocks and
+  `stale runtime … rerun install --force to upgrade`, and exits 1 when either
+  is found.
+
+The installed blocks instruct the agent to treat `board` as local-only and to
+verify freshness against the installer checkout (or say the checkout is
+unavailable) — never claim "not outdated" from `board` alone. The new
 runtime migrates an old per-session layout on the first command: the events are
 folded into `data/YYYY-MM-DD.jsonl` and the original file is moved to
 `data/legacy/` (nothing is deleted). To see it first:

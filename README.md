@@ -172,6 +172,14 @@ overridden for tests via `OPENCODE_DB`, `CLAUDE_PROJECTS_DIR`,
 
 - **Local only.** `.relay/` is git-ignored and never shared across machines by
   this tool.
+- **Two-level version truth (do not regress this).** The runtime `board` /
+  `doctor` only prove a *local* match (blocks vs installed runtime) and must
+  word it as `match runtime vN`, never as absolute `OK` / `up to date`. Only
+  `scripts/relay_setup.py doctor --target …` (run from this checkout) can
+  declare a target current against the source, because only it sees both the
+  installed state and the current `templates/` + `package/`. Every future
+  block bump must keep this split: runtime wording stays local-only, installer
+  wording stays source-of-truth, and `tests/test.sh` pins both.
 - **No destructive rewrite.** Target files are edited only inside the marker
   block. Unbalanced markers are refused instead of guessed.
 - **Idempotent.** Running install twice still leaves exactly one block.
